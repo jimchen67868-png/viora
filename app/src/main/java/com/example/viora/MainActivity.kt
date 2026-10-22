@@ -93,7 +93,7 @@ class AppVm(app: Application) : AndroidViewModel(app) {
         catch (e: Exception) { toast(e.message ?: "Can't reach the server") }
     }
 
-    private fun setMe(p: Profile) {
+    private fun saveMe(p: Profile) {
         me = p
         prefs.edit().putString("user", p.username).putString("bio", p.bio).putString("avatar", p.avatar).apply()
     }
@@ -110,7 +110,7 @@ class AppVm(app: Application) : AndroidViewModel(app) {
             val (token, profile) = api.auth(if (register) "/api/register" else "/api/login", user.trim(), pw)
             api.token = token
             prefs.edit().putString("base", api.base).putString("token", token).apply()
-            setMe(profile); load()
+            saveMe(profile); load()
         } finally { busy = false }
     }
 
@@ -121,7 +121,7 @@ class AppVm(app: Application) : AndroidViewModel(app) {
 
     fun refresh() = safe {
         refreshing = true
-        try { setMe(api.me()); load() } finally { refreshing = false }
+        try { saveMe(api.me()); load() } finally { refreshing = false }
     }
 
     fun toggleLike(p: Post) {
@@ -158,7 +158,7 @@ class AppVm(app: Application) : AndroidViewModel(app) {
                 val bytes = withContext(Dispatchers.IO) { readJpeg(getApplication<Application>(), newAvatar, 512) }
                 p = api.setAvatar(bytes)
             } else if (removeAvatar) p = api.removeAvatar()
-            setMe(p); load()
+            saveMe(p); load()
         } finally { busy = false }
     }
 }
