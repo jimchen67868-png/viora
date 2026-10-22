@@ -22,9 +22,15 @@ import java.io.ByteArrayOutputStream
 import java.net.URLEncoder
 import java.util.concurrent.TimeUnit
 
+/** Your server's address. Change this to your Render URL (no trailing slash). */
+const val SERVER_URL = "https://viora-server.onrender.com"
+
 class ApiException(val code: Int, message: String) : Exception(message)
 
-class Profile(val username: String, val bio: String, val avatar: String?)
+class Profile(
+    val username: String, val bio: String, val avatar: String?,
+    val email: String? = null, val emailVerified: Boolean = false
+)
 class Comment(val user: String, val avatar: String?, val text: String)
 class Story(val user: String, val avatar: String?, val images: List<String>)
 
@@ -39,7 +45,8 @@ class Post(
 }
 
 private fun JSONObject.str(k: String): String? = if (isNull(k)) null else getString(k)
-private fun JSONObject.toProfile() = Profile(getString("username"), optString("bio", ""), str("avatar"))
+private fun JSONObject.toProfile() =
+    Profile(getString("username"), optString("bio", ""), str("avatar"), str("email"), optBoolean("email_verified", false))
 private fun JSONObject.toComment() = Comment(getString("user"), str("avatar"), getString("text"))
 private fun JSONObject.toPost() = Post(
     getInt("id"), getString("user"), str("avatar"), getString("image"),
@@ -73,8 +80,17 @@ class Api(var base: String, var token: String?) {
         return j.getString("token") to j.getJSONObject("user").toProfile()
     }
     suspend fun me() = send("GET", "/api/me").getJSONObject("user").toProfile()
-    suspend fun updateBio(bio: String) = send("PUT", "/api/me", json("bio" to bio)).getJSONObject("user").toProfile()
+    suspend fun updateProfile(username: String, bio: String) =
+        send("PUT", "/api/me", json("username" to username, "bio" to bio)).getJSONObject("user").toProfile()
     suspend fun setAvatar(img: ByteArray) = send("POST", "/api/me/avatar", img.toRequestBody(JPEG)).getJSONObject("user").toProfile()
+    suspend fun setEmail(email: String) = send("PUT", "/api/me/email", json("email" to email)).getJSONObject("user").toProfile()
+    suspend fun sendEmailCode() { send("POST", "/api/me/email/send") }
+    suspend fun verifyEmail(code: String) = send("POST", "/api/me/email/verify", json("code" to code)).getJSONObject("user").toProfile()
+    suspend fun removeEmail() = send("DELETE", "/api/me/email").getJSONObject("user").toProfile()
+    suspend fun forgotPassword(email: String) { send("POST", "/api/password/forgot", json("email" to email)) }
+    suspend fun resetPassword(email: String, code: String, password: String) {
+        send("POST", "/api/password/reset", json("email" to email, "code" to code, "password" to password))
+    }
     suspend fun removeAvatar() = send("DELETE", "/api/me/avatar").getJSONObject("user").toProfile()
 
     suspend fun posts(): List<Post> {

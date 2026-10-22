@@ -2,7 +2,7 @@
 """Viora server: REST API + image hosting. Pure Python 3.8+ standard library, SQLite storage.
 Run:  python3 server.py   (env: PORT=8000, DATABASE_URL=postgres://... or VIORA_DATA=./data for SQLite)
 """
-import hashlib, hmac, json, os, re, secrets, sqlite3, time, traceback
+import hashlib, hmac, json, os, re, secrets, sqlite3, time, traceback, urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
@@ -29,6 +29,7 @@ SCHEMA = [
  f"CREATE TABLE IF NOT EXISTS posts(id {PK}, user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE, image TEXT NOT NULL, caption TEXT NOT NULL DEFAULT '', created DOUBLE PRECISION)",
  "CREATE TABLE IF NOT EXISTS likes(post_id INTEGER REFERENCES posts(id) ON DELETE CASCADE, user_id INTEGER REFERENCES users(id) ON DELETE CASCADE, PRIMARY KEY(post_id, user_id))",
  f"CREATE TABLE IF NOT EXISTS comments(id {PK}, post_id INTEGER NOT NULL REFERENCES posts(id) ON DELETE CASCADE, user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE, text TEXT NOT NULL, created DOUBLE PRECISION)",
+ f"CREATE TABLE IF NOT EXISTS codes(id {PK}, user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE, kind TEXT NOT NULL, email TEXT NOT NULL, code_hash TEXT NOT NULL, expires DOUBLE PRECISION, created DOUBLE PRECISION, attempts INTEGER NOT NULL DEFAULT 0)",
  f"CREATE TABLE IF NOT EXISTS stories(id {PK}, user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE, image TEXT NOT NULL, created DOUBLE PRECISION)",
 ]
 INTEGRITY = (sqlite3.IntegrityError, psycopg2.IntegrityError) if PG else (sqlite3.IntegrityError,)
@@ -55,6 +56,13 @@ def db(): return DB()
 
 with db() as _c:
     for _s in SCHEMA: _c.execute(_s)
+for _col, _typ in (("email", "TEXT"), ("email_verified", "INTEGER NOT NULL DEFAULT 0")):
+    try:  # add columns to databases created before email support existed
+        with db() as _c: _c.execute(f"ALTER TABLE users ADD COLUMN {'IF NOT EXISTS ' if PG else ''}{_col} {_typ}")
+    except Exception:
+        pass
+with db() as _c:  # an email can belong to only one account once verified
+    _c.execute("CREATE UNIQUE INDEX IF NOT EXISTS users_email ON users(LOWER(email)) WHERE email_verified=1")
 
 class HTTPError(Exception):
     def __init__(self, code, msg):
@@ -78,6 +86,50 @@ def save_image(c, b):
 
 def remove_image(c, name):
     if name and str(name).isdigit(): c.execute("DELETE FROM images WHERE id=?", (int(name),))
+
+EMAIL_RE = re.compile(r"[^@\s]+@[^@\s]+\.[^@\s]+")
+
+def send_mail(to, subject, text):
+    """Sends via Brevo's HTTPS API (Render's free tier blocks SMTP ports). Env: BREVO_API_KEY, MAIL_FROM."""
+    key, sender = os.environ.get("BREVO_API_KEY"), os.environ.get("MAIL_FROM")
+    if not key or not sender:
+        if os.environ.get("MAIL_DEBUG"):
+            print(f"[mail] to={to} subject={subject}\n{text}", flush=True); return
+        raise HTTPError(503, "Email is not set up on this server yet")
+    req = urllib.request.Request(
+        "https://api.brevo.com/v3/smtp/email",
+        data=json.dumps({"sender": {"name": "Viora", "email": sender}, "to": [{"email": to}],
+                         "subject": subject, "textContent": text}).encode(),
+        headers={"api-key": key, "content-type": "application/json", "accept": "application/json"})
+    try:
+        urllib.request.urlopen(req, timeout=15).read()
+    except Exception:
+        traceback.print_exc()
+        raise HTTPError(502, "Couldn't send the email. Try again later.")
+
+def hash_code(code, uid, kind):
+    return hashlib.sha256(f"{kind}:{uid}:{code}".encode()).hexdigest()
+
+def issue_code(c, uid, kind, email):
+    now = time.time()
+    last = c.execute("SELECT created FROM codes WHERE user_id=? AND kind=? ORDER BY id DESC LIMIT 1", (uid, kind)).fetchone()
+    if last and now - last["created"] < 60: raise HTTPError(429, "Please wait a minute before requesting another code")
+    code = "%06d" % secrets.randbelow(10 ** 6)
+    c.execute("DELETE FROM codes WHERE user_id=? AND kind=?", (uid, kind))
+    c.execute("INSERT INTO codes(user_id,kind,email,code_hash,expires,created) VALUES(?,?,?,?,?,?)",
+              (uid, kind, email, hash_code(code, uid, kind), now + 900, now))
+    return code
+
+def check_code(c, uid, kind, code):
+    """Returns the email the code was sent to. 5 wrong tries burns the code; codes last 15 minutes."""
+    r = c.execute("SELECT * FROM codes WHERE user_id=? AND kind=? ORDER BY id DESC LIMIT 1", (uid, kind)).fetchone()
+    if not r or r["expires"] < time.time(): raise HTTPError(400, "Code expired. Request a new one.")
+    if r["attempts"] >= 5: raise HTTPError(400, "Too many wrong tries. Request a new code.")
+    if not hmac.compare_digest(r["code_hash"], hash_code(str(code).strip(), uid, kind)):
+        c.execute("UPDATE codes SET attempts=attempts+1 WHERE id=?", (r["id"],))
+        c.c.commit()  # keep the counter even though we raise
+        raise HTTPError(400, "Wrong code")
+    return r["email"]
 
 ROUTES = []
 def route(method, pattern):
@@ -122,7 +174,8 @@ class H(BaseHTTPRequestHandler):
         return f"{proto}://{self.headers.get('Host', 'localhost')}/uploads/{f}"
 
     def profile(self, u):
-        return {"username": u["username"], "bio": u["bio"], "avatar": self.url(u["avatar"])}
+        return {"username": u["username"], "bio": u["bio"], "avatar": self.url(u["avatar"]),
+                "email": u["email"], "email_verified": bool(u["email_verified"])}
 
     def post_json(self, c, uid, where="", args=()):
         rows = c.execute(f"""SELECT p.id, p.caption, p.image, u.username, u.avatar,
@@ -211,8 +264,17 @@ def me(h, q):
 def update_me(h, q):
     d = h.json_body()
     with db() as c:
-        u = h.user(c); bio = str(d.get("bio", u["bio"]))[:150]
-        c.execute("UPDATE users SET bio=? WHERE id=?", (bio, u["id"]))
+        u = h.user(c)
+        bio = str(d.get("bio", u["bio"]))[:150]
+        name = str(d.get("username", u["username"])).strip()
+        if name != u["username"]:
+            if not re.fullmatch(r"[A-Za-z0-9_.]{3,20}", name): raise HTTPError(400, "Username: 3-20 letters, digits, _ or .")
+            if c.execute("SELECT 1 FROM users WHERE LOWER(username)=LOWER(?) AND id<>?", (name, u["id"])).fetchone():
+                raise HTTPError(409, "Username already taken")
+        try:
+            c.execute("UPDATE users SET bio=?, username=? WHERE id=?", (bio, name, u["id"]))
+        except INTEGRITY:
+            raise HTTPError(409, "Username already taken")
         u = c.execute("SELECT * FROM users WHERE id=?", (u["id"],)).fetchone()
     h.send_json(200, {"user": h.profile(u)})
 
@@ -232,6 +294,89 @@ def del_avatar(h, q):
         c.execute("UPDATE users SET avatar=NULL WHERE id=?", (u["id"],)); remove_image(c, u["avatar"])
         u = c.execute("SELECT * FROM users WHERE id=?", (u["id"],)).fetchone()
     h.send_json(200, {"user": h.profile(u)})
+
+
+def clean_email(d):
+    e = str(d.get("email", "")).strip()
+    if len(e) > 254 or not EMAIL_RE.fullmatch(e): raise HTTPError(400, "Enter a valid email address")
+    return e
+
+@route("PUT", "/api/me/email")
+def set_email(h, q):
+    email = clean_email(h.json_body())
+    with db() as c:
+        u = h.user(c)
+        if u["email"] and u["email"].lower() == email.lower() and u["email_verified"]:
+            return h.send_json(200, {"user": h.profile(u)})
+        if c.execute("SELECT 1 FROM users WHERE LOWER(email)=LOWER(?) AND email_verified=1 AND id<>?", (email, u["id"])).fetchone():
+            raise HTTPError(409, "That email is already used by another account")
+        code = issue_code(c, u["id"], "verify", email)
+        c.execute("UPDATE users SET email=?, email_verified=0 WHERE id=?", (email, u["id"]))
+        send_mail(email, "Your Viora verification code", f"Your Viora verification code is {code}\n\nIt expires in 15 minutes. If you didn't ask for this, ignore this email.")
+        u = c.execute("SELECT * FROM users WHERE id=?", (u["id"],)).fetchone()
+    h.send_json(200, {"user": h.profile(u)})
+
+@route("POST", "/api/me/email/send")
+def resend_email_code(h, q):
+    with db() as c:
+        u = h.user(c)
+        if not u["email"] or u["email_verified"]: raise HTTPError(400, "No email waiting for verification")
+        code = issue_code(c, u["id"], "verify", u["email"])
+        send_mail(u["email"], "Your Viora verification code", f"Your Viora verification code is {code}\n\nIt expires in 15 minutes.")
+    h.send_json(200, {"ok": True})
+
+@route("POST", "/api/me/email/verify")
+def verify_email(h, q):
+    code = h.json_body().get("code", "")
+    with db() as c:
+        u = h.user(c)
+        if not u["email"]: raise HTTPError(400, "Add an email first")
+        sent_to = check_code(c, u["id"], "verify", code)
+        if sent_to.lower() != u["email"].lower(): raise HTTPError(400, "Code was for a different email. Request a new one.")
+        try:
+            c.execute("UPDATE users SET email_verified=1 WHERE id=?", (u["id"],))
+        except INTEGRITY:
+            raise HTTPError(409, "That email is already used by another account")
+        c.execute("DELETE FROM codes WHERE user_id=? AND kind=?", (u["id"], "verify"))
+        u = c.execute("SELECT * FROM users WHERE id=?", (u["id"],)).fetchone()
+    h.send_json(200, {"user": h.profile(u)})
+
+@route("DELETE", "/api/me/email")
+def remove_email(h, q):
+    with db() as c:
+        u = h.user(c)
+        c.execute("UPDATE users SET email=NULL, email_verified=0 WHERE id=?", (u["id"],))
+        c.execute("DELETE FROM codes WHERE user_id=?", (u["id"],))
+        u = c.execute("SELECT * FROM users WHERE id=?", (u["id"],)).fetchone()
+    h.send_json(200, {"user": h.profile(u)})
+
+@route("POST", "/api/password/forgot")
+def forgot_password(h, q):
+    email = clean_email(h.json_body())
+    try:
+        with db() as c:
+            u = c.execute("SELECT * FROM users WHERE LOWER(email)=LOWER(?) AND email_verified=1", (email,)).fetchone()
+            if u:
+                code = issue_code(c, u["id"], "reset", u["email"])
+                send_mail(u["email"], "Reset your Viora password",
+                          f"Hi {u['username']},\n\nYour Viora password reset code is {code}\n\nIt expires in 15 minutes. If you didn't ask for this, ignore this email.")
+    except HTTPError as e:
+        print("forgot_password:", e.code, e.msg, flush=True)  # same reply either way: don't reveal which emails exist
+    h.send_json(200, {"ok": True})
+
+@route("POST", "/api/password/reset")
+def reset_password(h, q):
+    d = h.json_body(); email = clean_email(d); pw = str(d.get("password", ""))
+    if len(pw) < 6: raise HTTPError(400, "Password must be at least 6 characters")
+    with db() as c:
+        u = c.execute("SELECT * FROM users WHERE LOWER(email)=LOWER(?) AND email_verified=1", (email,)).fetchone()
+        if not u: raise HTTPError(400, "Wrong code")
+        check_code(c, u["id"], "reset", d.get("code", ""))
+        salt = secrets.token_hex(16)
+        c.execute("UPDATE users SET salt=?, pw=? WHERE id=?", (salt, hash_pw(pw, salt), u["id"]))
+        c.execute("DELETE FROM sessions WHERE user_id=?", (u["id"],))
+        c.execute("DELETE FROM codes WHERE user_id=?", (u["id"],))
+    h.send_json(200, {"ok": True})
 
 @route("GET", "/api/posts")
 def list_posts(h, q):

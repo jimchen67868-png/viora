@@ -27,6 +27,7 @@ import androidx.compose.foundation.lazy.grid.items
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
@@ -54,6 +55,7 @@ import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.text.SpanStyle
 import androidx.compose.ui.text.buildAnnotatedString
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.unit.dp
@@ -71,7 +73,7 @@ import kotlinx.coroutines.withContext
 // ---------- ViewModel ----------
 class AppVm(app: Application) : AndroidViewModel(app) {
     private val prefs = app.getSharedPreferences("viora", Context.MODE_PRIVATE)
-    val api = Api(prefs.getString("base", "http://127.0.0.1:8000")!!, prefs.getString("token", null))
+    val api = Api(SERVER_URL, prefs.getString("token", null))
     var me by mutableStateOf<Profile?>(null)
     val posts = mutableStateListOf<Post>()
     val stories = mutableStateListOf<Story>()
@@ -85,7 +87,7 @@ class AppVm(app: Application) : AndroidViewModel(app) {
         }
     }
 
-    private fun toast(msg: String?) = Toast.makeText(getApplication<Application>(), msg ?: "Something went wrong", Toast.LENGTH_LONG).show()
+    fun toast(msg: String?) = Toast.makeText(getApplication<Application>(), msg ?: "Something went wrong", Toast.LENGTH_LONG).show()
 
     private fun safe(block: suspend () -> Unit) = viewModelScope.launch {
         try { block() }
@@ -103,13 +105,12 @@ class AppVm(app: Application) : AndroidViewModel(app) {
         posts.clear(); posts.addAll(p); stories.clear(); stories.addAll(s)
     }
 
-    fun auth(register: Boolean, base: String, user: String, pw: String) = safe {
+    fun auth(register: Boolean, user: String, pw: String) = safe {
         busy = true
         try {
-            api.base = base.trim().trimEnd('/')
             val (token, profile) = api.auth(if (register) "/api/register" else "/api/login", user.trim(), pw)
             api.token = token
-            prefs.edit().putString("base", api.base).putString("token", token).apply()
+            prefs.edit().putString("token", token).apply()
             saveMe(profile); load()
         } finally { busy = false }
     }
@@ -150,10 +151,30 @@ class AppVm(app: Application) : AndroidViewModel(app) {
         } finally { busy = false }
     }
 
-    fun saveProfile(bio: String, newAvatar: Uri?, removeAvatar: Boolean) = safe {
+
+    fun setEmail(email: String, ok: () -> Unit) = safe {
+        busy = true
+        try { saveMe(api.setEmail(email)); toast("Verification code sent"); ok() } finally { busy = false }
+    }
+    fun resendEmailCode() = safe { api.sendEmailCode(); toast("Code sent") }
+    fun verifyEmail(code: String, ok: () -> Unit) = safe {
+        busy = true
+        try { saveMe(api.verifyEmail(code)); toast("Email verified ✓"); ok() } finally { busy = false }
+    }
+    fun removeEmail(ok: () -> Unit) = safe { saveMe(api.removeEmail()); ok() }
+    fun forgotPassword(email: String, ok: () -> Unit) = safe {
+        busy = true
+        try { api.forgotPassword(email); toast("If that email is registered, a code was sent"); ok() } finally { busy = false }
+    }
+    fun resetPassword(email: String, code: String, pw: String, ok: () -> Unit) = safe {
+        busy = true
+        try { api.resetPassword(email, code, pw); toast("Password changed. Please log in."); ok() } finally { busy = false }
+    }
+
+    fun saveProfile(username: String, bio: String, newAvatar: Uri?, removeAvatar: Boolean) = safe {
         busy = true
         try {
-            var p = api.updateBio(bio)
+            var p = api.updateProfile(username, bio)
             if (newAvatar != null) {
                 val bytes = withContext(Dispatchers.IO) { readJpeg(getApplication<Application>(), newAvatar, 512) }
                 p = api.setAvatar(bytes)
@@ -195,17 +216,16 @@ fun App(vm: AppVm = viewModel()) {
 // ---------- Login ----------
 @Composable
 fun Login(vm: AppVm) {
-    var base by remember { mutableStateOf(vm.api.base) }
     var user by remember { mutableStateOf("") }
     var pw by remember { mutableStateOf("") }
+    var resetOpen by remember { mutableStateOf(false) }
+    if (resetOpen) ResetDialog(vm) { resetOpen = false }
     Column(
         Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(24.dp),
         verticalArrangement = Arrangement.Center, horizontalAlignment = Alignment.CenterHorizontally
     ) {
         Text("Viora", fontSize = 42.sp, fontWeight = FontWeight.Bold)
         Spacer(Modifier.height(24.dp))
-        OutlinedTextField(base, { base = it }, label = { Text("Server URL") }, singleLine = true, modifier = Modifier.fillMaxWidth())
-        Spacer(Modifier.height(8.dp))
         OutlinedTextField(user, { user = it }, label = { Text("Username") }, singleLine = true, modifier = Modifier.fillMaxWidth())
         Spacer(Modifier.height(8.dp))
         OutlinedTextField(
@@ -213,11 +233,89 @@ fun Login(vm: AppVm) {
             visualTransformation = PasswordVisualTransformation(), modifier = Modifier.fillMaxWidth()
         )
         Spacer(Modifier.height(16.dp))
-        Button({ vm.auth(false, base, user, pw) }, enabled = !vm.busy && user.isNotBlank() && pw.isNotEmpty(), modifier = Modifier.fillMaxWidth()) {
+        Button({ vm.auth(false, user, pw) }, enabled = !vm.busy && user.isNotBlank() && pw.isNotEmpty(), modifier = Modifier.fillMaxWidth()) {
             Text(if (vm.busy) "Please wait…" else "Log in")
         }
-        TextButton({ vm.auth(true, base, user, pw) }, enabled = !vm.busy && user.isNotBlank() && pw.isNotEmpty()) { Text("Create account") }
+        TextButton({ vm.auth(true, user, pw) }, enabled = !vm.busy && user.isNotBlank() && pw.isNotEmpty()) { Text("Create account") }
+        TextButton({ resetOpen = true }) { Text("Forgot password?") }
     }
+}
+
+
+@Composable
+fun ResetDialog(vm: AppVm, onClose: () -> Unit) {
+    var stage by remember { mutableIntStateOf(0) }
+    var email by remember { mutableStateOf("") }
+    var code by remember { mutableStateOf("") }
+    var pw by remember { mutableStateOf("") }
+    AlertDialog(
+        onDismissRequest = onClose,
+        title = { Text("Reset password") },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                if (stage == 0) {
+                    Text("Enter the verified email on your account and we'll send you a code.", color = Color.Gray, fontSize = 13.sp)
+                    OutlinedTextField(email, { email = it.trim() }, label = { Text("Email") }, singleLine = true,
+                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Email), modifier = Modifier.fillMaxWidth())
+                } else {
+                    Text("Enter the 6-digit code sent to $email and choose a new password.", color = Color.Gray, fontSize = 13.sp)
+                    OutlinedTextField(code, { if (it.length <= 6 && it.all(Char::isDigit)) code = it }, label = { Text("Code") }, singleLine = true,
+                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number), modifier = Modifier.fillMaxWidth())
+                    OutlinedTextField(pw, { pw = it }, label = { Text("New password") }, singleLine = true,
+                        visualTransformation = PasswordVisualTransformation(), modifier = Modifier.fillMaxWidth())
+                    TextButton({ stage = 0 }) { Text("Use a different email") }
+                }
+            }
+        },
+        confirmButton = {
+            TextButton(
+                onClick = { if (stage == 0) vm.forgotPassword(email) { stage = 1 } else vm.resetPassword(email, code, pw, onClose) },
+                enabled = !vm.busy && (if (stage == 0) email.contains("@") else code.length == 6 && pw.length >= 6)
+            ) { Text(if (stage == 0) "Send code" else "Reset password") }
+        },
+        dismissButton = { TextButton(onClose) { Text("Cancel") } }
+    )
+}
+
+@Composable
+fun EmailDialog(vm: AppVm, onClose: () -> Unit) {
+    val me = vm.me ?: return
+    var stage by remember { mutableIntStateOf(if (me.email != null && !me.emailVerified) 1 else 0) }
+    var email by remember { mutableStateOf(me.email ?: "") }
+    var code by remember { mutableStateOf("") }
+    AlertDialog(
+        onDismissRequest = onClose,
+        title = { Text(if (stage == 0) "Your email" else "Verify your email") },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                if (stage == 0) {
+                    Text("Used to verify your account and to reset your password if you forget it.", color = Color.Gray, fontSize = 13.sp)
+                    OutlinedTextField(email, { email = it.trim() }, label = { Text("Email") }, singleLine = true,
+                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Email), modifier = Modifier.fillMaxWidth())
+                } else {
+                    Text("Enter the 6-digit code we sent to ${me.email ?: email}.", color = Color.Gray, fontSize = 13.sp)
+                    OutlinedTextField(code, { if (it.length <= 6 && it.all(Char::isDigit)) code = it }, label = { Text("Code") }, singleLine = true,
+                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number), modifier = Modifier.fillMaxWidth())
+                    Row {
+                        TextButton({ vm.resendEmailCode() }) { Text("Resend code") }
+                        TextButton({ stage = 0 }) { Text("Change email") }
+                    }
+                }
+            }
+        },
+        confirmButton = {
+            TextButton(
+                onClick = { if (stage == 0) vm.setEmail(email) { stage = 1; code = "" } else vm.verifyEmail(code, onClose) },
+                enabled = !vm.busy && (if (stage == 0) email.contains("@") else code.length == 6)
+            ) { Text(if (stage == 0) "Send code" else "Verify") }
+        },
+        dismissButton = {
+            Row {
+                if (stage == 0 && me.email != null) TextButton({ vm.removeEmail(onClose) }) { Text("Remove", color = Color.Red) }
+                TextButton(onClose) { Text("Close") }
+            }
+        }
+    )
 }
 
 // ---------- Shared pieces ----------
@@ -499,6 +597,8 @@ fun ProfileScreen(vm: AppVm) {
     val mine = vm.posts.filter { it.user == me.username }
     var photo by remember { mutableStateOf<String?>(null) }
     var editing by remember { mutableStateOf(false) }
+    var emailOpen by remember { mutableStateOf(false) }
+    var draftName by remember { mutableStateOf("") }
     var draftBio by remember { mutableStateOf("") }
     var draftAvatar by remember { mutableStateOf<Uri?>(null) }
     var removing by remember { mutableStateOf(false) }
@@ -517,8 +617,19 @@ fun ProfileScreen(vm: AppVm) {
             TextButton({ vm.logout() }) { Text("Log out") }
         }
         if (me.bio.isNotBlank()) Text(me.bio, Modifier.padding(horizontal = 16.dp))
+        val unverified = me.email != null && !me.emailVerified
+        Text(
+            when {
+                me.email == null -> "＋ Add email (needed to reset your password)"
+                unverified -> "${me.email} · not verified — tap to verify"
+                else -> "${me.email} ✓ verified"
+            },
+            color = if (me.email == null || unverified) Color(0xFFD97706) else Color.Gray,
+            fontSize = 13.sp,
+            modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp).clickable { emailOpen = true }
+        )
         OutlinedButton(
-            onClick = { draftBio = me.bio; draftAvatar = null; removing = false; editing = true },
+            onClick = { draftName = me.username; draftBio = me.bio; draftAvatar = null; removing = false; editing = true },
             modifier = Modifier.fillMaxWidth().padding(16.dp)
         ) { Text("Edit profile") }
         HorizontalDivider()
@@ -531,6 +642,7 @@ fun ProfileScreen(vm: AppVm) {
         }
     }
     photo?.let { PhotoViewer(it) { photo = null } }
+    if (emailOpen) EmailDialog(vm) { emailOpen = false }
 
     if (editing) {
         AlertDialog(
@@ -549,6 +661,11 @@ fun ProfileScreen(vm: AppVm) {
                         if (previewUrl != null) TextButton({ draftAvatar = null; removing = true }) { Text("Remove") }
                     }
                     OutlinedTextField(
+                        draftName, { if (it.length <= 20) draftName = it.trim() },
+                        label = { Text("Username") }, singleLine = true, modifier = Modifier.fillMaxWidth()
+                    )
+                    Spacer(Modifier.height(8.dp))
+                    OutlinedTextField(
                         draftBio, { if (it.length <= 150) draftBio = it },
                         label = { Text("Bio") }, supportingText = { Text("${draftBio.length}/150") },
                         modifier = Modifier.fillMaxWidth(), minLines = 3
@@ -556,7 +673,7 @@ fun ProfileScreen(vm: AppVm) {
                 }
             },
             confirmButton = {
-                TextButton({ vm.saveProfile(draftBio.trim(), draftAvatar, removing); editing = false }) { Text("Save") }
+                TextButton({ vm.saveProfile(draftName, draftBio.trim(), draftAvatar, removing); editing = false }) { Text("Save") }
             },
             dismissButton = { TextButton({ editing = false }) { Text("Cancel") } }
         )
