@@ -2,7 +2,7 @@
 """Viora server: REST API + image hosting. Pure Python 3.8+ standard library, SQLite storage.
 Run:  python3 server.py   (env: PORT=8000, DATABASE_URL=postgres://... or VIORA_DATA=./data for SQLite)
 """
-import hashlib, hmac, json, os, re, secrets, sqlite3, time, traceback, urllib.request
+import hashlib, hmac, json, math, os, re, secrets, sqlite3, time, traceback, urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
@@ -56,7 +56,7 @@ def db(): return DB()
 
 with db() as _c:
     for _s in SCHEMA: _c.execute(_s)
-for _col, _typ in (("email", "TEXT"), ("email_verified", "INTEGER NOT NULL DEFAULT 0")):
+for _col, _typ in (("email", "TEXT"), ("email_verified", "INTEGER NOT NULL DEFAULT 0"), ("is_vip", "INTEGER NOT NULL DEFAULT 0")):
     try:  # add columns to databases created before email support existed
         with db() as _c: _c.execute(f"ALTER TABLE users ADD COLUMN {'IF NOT EXISTS ' if PG else ''}{_col} {_typ}")
     except Exception:
@@ -175,14 +175,14 @@ class H(BaseHTTPRequestHandler):
 
     def profile(self, u):
         return {"username": u["username"], "bio": u["bio"], "avatar": self.url(u["avatar"]),
-                "email": u["email"], "email_verified": bool(u["email_verified"])}
+                "email": u["email"], "email_verified": bool(u["email_verified"]), "vip": bool(u["is_vip"])}
 
-    def post_json(self, c, uid, where="", args=()):
+    def post_json(self, c, uid, where="", args=(), limit=100):
         rows = c.execute(f"""SELECT p.id, p.caption, p.image, u.username, u.avatar,
             (SELECT COUNT(*) FROM likes WHERE post_id=p.id) AS likes,
             EXISTS(SELECT 1 FROM likes WHERE post_id=p.id AND user_id=?) AS liked,
             (SELECT COUNT(*) FROM comments WHERE post_id=p.id) AS comments
-            FROM posts p JOIN users u ON u.id=p.user_id {where} ORDER BY p.id DESC LIMIT 100""", (uid, *args)).fetchall()
+            FROM posts p JOIN users u ON u.id=p.user_id {where} ORDER BY p.id DESC LIMIT {int(limit)}""", (uid, *args)).fetchall()
         return [{"id": r["id"], "user": r["username"], "avatar": self.url(r["avatar"]), "image": self.url(r["image"]),
                  "caption": r["caption"], "likes": r["likes"], "liked": bool(r["liked"]), "comments": r["comments"]} for r in rows]
 
@@ -377,6 +377,66 @@ def reset_password(h, q):
         c.execute("DELETE FROM sessions WHERE user_id=?", (u["id"],))
         c.execute("DELETE FROM codes WHERE user_id=?", (u["id"],))
     h.send_json(200, {"ok": True})
+
+@route("GET", r"/api/users/([A-Za-z0-9_.]{3,20})")
+def user_profile(h, q, name):
+    with db() as c:
+        me = h.user(c)
+        u = c.execute("SELECT * FROM users WHERE LOWER(username)=LOWER(?)", (name,)).fetchone()
+        if not u: raise HTTPError(404, "User not found")
+        posts = h.post_json(c, me["id"], "WHERE p.user_id=?", (u["id"],))
+    # public view: never include the email
+    h.send_json(200, {"user": {"username": u["username"], "bio": u["bio"], "avatar": h.url(u["avatar"])}, "posts": posts})
+
+@route("GET", "/api/search")
+def search(h, q):
+    term = q.get("q", [""])[0].strip()[:50]
+    with db() as c:
+        me = h.user(c)
+        if not term: return h.send_json(200, {"users": [], "posts": []})
+        pat = "%" + term.replace("!", "!!").replace("%", "!%").replace("_", "!_") + "%"
+        rows = c.execute("SELECT username, bio, avatar FROM users WHERE LOWER(username) LIKE LOWER(?) ESCAPE '!' ORDER BY LOWER(username) LIMIT 20", (pat,)).fetchall()
+        posts = h.post_json(c, me["id"], "WHERE LOWER(p.caption) LIKE LOWER(?) ESCAPE '!'", (pat,))
+    h.send_json(200, {"users": [{"username": r["username"], "bio": r["bio"], "avatar": h.url(r["avatar"])} for r in rows], "posts": posts})
+
+STOP = set("the and for with this that you your are was were have has had not but from they them their our out all can will just into over about more some what when who how why its it's i'm".split())
+
+def words(text):
+    return {w for w in re.findall(r"#?\w{3,}", (text or "").lower()) if w not in STOP}
+
+@route("GET", "/api/feed/for-you")
+def for_you(h, q):
+    """VIP-only feed ranked by similarity to what the user has liked: same authors and shared words/#hashtags."""
+    with db() as c:
+        u = h.user(c)
+        if not u["is_vip"]: raise HTTPError(403, "For You is a VIP feature")
+        liked = c.execute("""SELECT au.username, p.caption FROM likes l JOIN posts p ON p.id=l.post_id
+                             JOIN users au ON au.id=p.user_id WHERE l.user_id=? ORDER BY p.id DESC LIMIT 100""", (u["id"],)).fetchall()
+        authors, kw = {}, {}
+        for r in liked:
+            authors[r["username"]] = authors.get(r["username"], 0) + 1
+            for w in words(r["caption"]): kw[w] = kw.get(w, 0) + (2 if w.startswith("#") else 1)
+        cand = h.post_json(c, u["id"], "WHERE p.user_id<>?", (u["id"],), limit=300)
+    scored = []
+    for i, p in enumerate(cand):  # cand is newest first
+        if p["liked"]: continue
+        score = (3 * min(authors.get(p["user"], 0), 5)
+                 + min(sum(kw.get(w, 0) for w in words(p["caption"])), 10)
+                 + math.log1p(p["likes"]) + max(0.0, 2 - i / 50))
+        scored.append((-score, i, p))
+    scored.sort(key=lambda t: (t[0], t[1]))
+    h.send_json(200, {"posts": [p for _, _, p in scored[:50]], "personalized": bool(liked)})
+
+@route("POST", "/api/admin/vip")
+def set_vip(h, q):
+    key = os.environ.get("ADMIN_KEY", "")
+    if not key or not hmac.compare_digest(h.headers.get("X-Admin-Key", "").encode(), key.encode()):
+        raise HTTPError(403, "Forbidden")
+    d = h.json_body(); name = str(d.get("username", "")).strip(); vip = 1 if d.get("vip", True) else 0
+    with db() as c:
+        if not c.execute("UPDATE users SET is_vip=? WHERE LOWER(username)=LOWER(?)", (vip, name)).rowcount:
+            raise HTTPError(404, "User not found")
+    h.send_json(200, {"ok": True, "username": name, "vip": bool(vip)})
 
 @route("GET", "/api/posts")
 def list_posts(h, q):

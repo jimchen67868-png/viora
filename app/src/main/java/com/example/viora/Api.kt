@@ -29,7 +29,7 @@ class ApiException(val code: Int, message: String) : Exception(message)
 
 class Profile(
     val username: String, val bio: String, val avatar: String?,
-    val email: String? = null, val emailVerified: Boolean = false
+    val email: String? = null, val emailVerified: Boolean = false, val vip: Boolean = false
 )
 class Comment(val user: String, val avatar: String?, val text: String)
 class Story(val user: String, val avatar: String?, val images: List<String>)
@@ -46,7 +46,7 @@ class Post(
 
 private fun JSONObject.str(k: String): String? = if (isNull(k)) null else getString(k)
 private fun JSONObject.toProfile() =
-    Profile(getString("username"), optString("bio", ""), str("avatar"), str("email"), optBoolean("email_verified", false))
+    Profile(getString("username"), optString("bio", ""), str("avatar"), str("email"), optBoolean("email_verified", false), optBoolean("vip", false))
 private fun JSONObject.toComment() = Comment(getString("user"), str("avatar"), getString("text"))
 private fun JSONObject.toPost() = Post(
     getInt("id"), getString("user"), str("avatar"), getString("image"),
@@ -96,6 +96,21 @@ class Api(var base: String, var token: String?) {
     suspend fun posts(): List<Post> {
         val a = send("GET", "/api/posts").getJSONArray("posts")
         return List(a.length()) { a.getJSONObject(it).toPost() }
+    }
+    suspend fun user(name: String): Pair<Profile, List<Post>> {
+        val j = send("GET", "/api/users/" + enc(name))
+        val a = j.getJSONArray("posts")
+        return j.getJSONObject("user").toProfile() to List(a.length()) { a.getJSONObject(it).toPost() }
+    }
+    suspend fun search(q: String): Pair<List<Profile>, List<Post>> {
+        val j = send("GET", "/api/search?q=" + enc(q))
+        val u = j.getJSONArray("users"); val p = j.getJSONArray("posts")
+        return List(u.length()) { u.getJSONObject(it).toProfile() } to List(p.length()) { p.getJSONObject(it).toPost() }
+    }
+    suspend fun forYou(): Pair<List<Post>, Boolean> {
+        val j = send("GET", "/api/feed/for-you")
+        val a = j.getJSONArray("posts")
+        return List(a.length()) { a.getJSONObject(it).toPost() } to j.optBoolean("personalized", false)
     }
     suspend fun createPost(img: ByteArray, caption: String) =
         send("POST", "/api/posts?caption=" + enc(caption), img.toRequestBody(JPEG)).getJSONObject("post").toPost()

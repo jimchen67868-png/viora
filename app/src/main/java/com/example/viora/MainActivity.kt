@@ -38,6 +38,7 @@ import androidx.compose.material.icons.filled.FavoriteBorder
 import androidx.compose.material.icons.filled.Home
 import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material.icons.filled.Person
+import androidx.compose.material.icons.filled.Search
 import androidx.compose.material.icons.filled.Send
 import androidx.compose.material.icons.outlined.ChatBubbleOutline
 import androidx.compose.material3.*
@@ -67,6 +68,7 @@ import androidx.lifecycle.viewModelScope
 import androidx.lifecycle.viewmodel.compose.viewModel
 import coil.compose.AsyncImage
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
@@ -77,6 +79,9 @@ class AppVm(app: Application) : AndroidViewModel(app) {
     var me by mutableStateOf<Profile?>(null)
     val posts = mutableStateListOf<Post>()
     val stories = mutableStateListOf<Story>()
+    val forYou = mutableStateListOf<Post>()
+    var forYouPersonal by mutableStateOf(true)
+    var feedMode by mutableIntStateOf(0)
     var refreshing by mutableStateOf(false)
     var busy by mutableStateOf(false)
 
@@ -116,14 +121,25 @@ class AppVm(app: Application) : AndroidViewModel(app) {
     }
 
     fun logout() {
-        api.token = null; me = null; posts.clear(); stories.clear()
+        api.token = null; me = null; posts.clear(); stories.clear(); forYou.clear(); feedMode = 0
         prefs.edit().remove("token").apply()
     }
 
     fun refresh() = safe {
         refreshing = true
-        try { saveMe(api.me()); load() } finally { refreshing = false }
+        try {
+            saveMe(api.me()); load()
+            if (me?.vip != true) feedMode = 0 else if (feedMode == 1) loadForYou()
+        } finally { refreshing = false }
     }
+
+    private suspend fun loadForYou() {
+        try {
+            val (list, personal) = api.forYou()
+            forYou.clear(); forYou.addAll(list); forYouPersonal = personal
+        } catch (e: ApiException) { if (e.code == 403) feedMode = 0; throw e }
+    }
+    fun openForYou() { feedMode = 1; safe { loadForYou() } }
 
     fun toggleLike(p: Post) {
         val wasLiked = p.liked; val wasCount = p.likes
@@ -199,14 +215,16 @@ fun App(vm: AppVm = viewModel()) {
     Scaffold(bottomBar = {
         NavigationBar {
             NavigationBarItem(tab == 0, { tab = 0 }, { Icon(Icons.Filled.Home, "Home") })
-            NavigationBarItem(tab == 1, { tab = 1 }, { Icon(Icons.Filled.AddBox, "New post") })
-            NavigationBarItem(tab == 2, { tab = 2 }, { Icon(Icons.Filled.Person, "Profile") })
+            NavigationBarItem(tab == 1, { tab = 1 }, { Icon(Icons.Filled.Search, "Search") })
+            NavigationBarItem(tab == 2, { tab = 2 }, { Icon(Icons.Filled.AddBox, "New post") })
+            NavigationBarItem(tab == 3, { tab = 3 }, { Icon(Icons.Filled.Person, "Profile") })
         }
     }) { pad ->
         Box(Modifier.padding(pad)) {
             when (tab) {
                 0 -> Feed(vm)
-                1 -> NewPost(vm) { tab = 0 }
+                1 -> SearchScreen(vm)
+                2 -> NewPost(vm) { tab = 0 }
                 else -> ProfileScreen(vm)
             }
         }
@@ -421,58 +439,148 @@ fun PhotoViewer(image: Any, onClose: () -> Unit) {
 }
 
 // ---------- Feed ----------
+class PostUi {
+    var commentsFor by mutableStateOf<Post?>(null)
+    var editing by mutableStateOf<Post?>(null)
+    var deleting by mutableStateOf<Post?>(null)
+    var photo by mutableStateOf<String?>(null)
+    var userView by mutableStateOf<String?>(null)
+    val removed = mutableStateListOf<Int>()
+}
+
+@Composable
+fun PostOverlays(vm: AppVm, ui: PostUi) {
+    ui.commentsFor?.let { CommentsSheet(it, vm, { n -> ui.commentsFor = null; ui.userView = n }) { ui.commentsFor = null } }
+    ui.photo?.let { PhotoViewer(it) { ui.photo = null } }
+    ui.userView?.let { UserScreen(vm, it) { ui.userView = null } }
+    ui.editing?.let { p ->
+        var text by remember(p) { mutableStateOf(p.caption) }
+        AlertDialog(
+            onDismissRequest = { ui.editing = null },
+            title = { Text("Edit caption") },
+            text = { OutlinedTextField(text, { text = it }, modifier = Modifier.fillMaxWidth()) },
+            confirmButton = { TextButton({ vm.editCaption(p, text.trim()); ui.editing = null }) { Text("Save") } },
+            dismissButton = { TextButton({ ui.editing = null }) { Text("Cancel") } }
+        )
+    }
+    ui.deleting?.let { p ->
+        AlertDialog(
+            onDismissRequest = { ui.deleting = null },
+            title = { Text("Delete post?") },
+            text = { Text("This can't be undone.") },
+            confirmButton = { TextButton({ vm.deletePost(p); ui.removed.add(p.id); ui.deleting = null }) { Text("Delete", color = Color.Red) } },
+            dismissButton = { TextButton({ ui.deleting = null }) { Text("Cancel") } }
+        )
+    }
+}
+
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun Feed(vm: AppVm) {
-    var commentsFor by remember { mutableStateOf<Post?>(null) }
-    var editing by remember { mutableStateOf<Post?>(null) }
-    var deleting by remember { mutableStateOf<Post?>(null) }
-    var photo by remember { mutableStateOf<String?>(null) }
+    val ui = remember { PostUi() }
     var story by remember { mutableStateOf<Story?>(null) }
 
     PullToRefreshBox(isRefreshing = vm.refreshing, onRefresh = { vm.refresh() }) {
         LazyColumn(Modifier.fillMaxSize()) {
             item { Stories(vm) { story = it } }
-            if (vm.posts.isEmpty() && !vm.refreshing)
-                item { Text("No posts yet. Share the first one from the + tab!", Modifier.padding(24.dp), color = Color.Gray) }
-            items(vm.posts, key = { it.id }) { p ->
-                PostCard(p, vm, onComments = { commentsFor = p }, onPhoto = { photo = p.image },
-                    onEdit = { editing = p }, onDelete = { deleting = p })
+            if (vm.me?.vip == true) item {
+                Row(Modifier.padding(horizontal = 12.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    FilterChip(vm.feedMode == 0, { vm.feedMode = 0 }, label = { Text("Latest") })
+                    FilterChip(vm.feedMode == 1, { vm.openForYou() }, label = { Text("⭐ For you") })
+                }
+                if (vm.feedMode == 1 && !vm.forYouPersonal)
+                    Text("Like a few posts and this feed will learn your taste. Showing popular posts for now.",
+                        Modifier.padding(horizontal = 16.dp, vertical = 8.dp), color = Color.Gray, fontSize = 13.sp)
+            }
+            val list = if (vm.feedMode == 1 && vm.me?.vip == true) vm.forYou else vm.posts
+            if (list.isEmpty() && !vm.refreshing)
+                item { Text(if (vm.feedMode == 1) "Nothing to recommend yet." else "No posts yet. Share the first one from the + tab!", Modifier.padding(24.dp), color = Color.Gray) }
+            items(list, key = { it.id }) { p ->
+                PostCard(p, vm, onComments = { ui.commentsFor = p }, onPhoto = { ui.photo = p.image },
+                    onEdit = { ui.editing = p }, onDelete = { ui.deleting = p }, onUser = { ui.userView = it })
             }
         }
     }
-    commentsFor?.let { CommentsSheet(it, vm) { commentsFor = null } }
-    photo?.let { PhotoViewer(it) { photo = null } }
     story?.let { StoryViewer(it) { story = null } }
-    editing?.let { p ->
-        var text by remember(p) { mutableStateOf(p.caption) }
-        AlertDialog(
-            onDismissRequest = { editing = null },
-            title = { Text("Edit caption") },
-            text = { OutlinedTextField(text, { text = it }, modifier = Modifier.fillMaxWidth()) },
-            confirmButton = { TextButton({ vm.editCaption(p, text.trim()); editing = null }) { Text("Save") } },
-            dismissButton = { TextButton({ editing = null }) { Text("Cancel") } }
-        )
+    PostOverlays(vm, ui)
+}
+
+// ---------- Search ----------
+@Composable
+fun SearchScreen(vm: AppVm) {
+    val ui = remember { PostUi() }
+    var query by remember { mutableStateOf("") }
+    var users by remember { mutableStateOf<List<Profile>>(emptyList()) }
+    var posts by remember { mutableStateOf<List<Post>>(emptyList()) }
+    var searching by remember { mutableStateOf(false) }
+    var searched by remember { mutableStateOf("") }
+
+    LaunchedEffect(query) {
+        val term = query.trim()
+        if (term.isEmpty()) { users = emptyList(); posts = emptyList(); searched = ""; return@LaunchedEffect }
+        delay(350)
+        searching = true
+        try {
+            val (u, p) = vm.api.search(term)
+            users = u; posts = p; searched = term
+        } catch (e: Exception) { vm.toast(e.message) }
+        searching = false
     }
-    deleting?.let { p ->
-        AlertDialog(
-            onDismissRequest = { deleting = null },
-            title = { Text("Delete post?") },
-            text = { Text("This can't be undone.") },
-            confirmButton = { TextButton({ vm.deletePost(p); deleting = null }) { Text("Delete", color = Color.Red) } },
-            dismissButton = { TextButton({ deleting = null }) { Text("Cancel") } }
+
+    Column(Modifier.fillMaxSize()) {
+        OutlinedTextField(
+            query, { query = it }, placeholder = { Text("Search people and posts") },
+            leadingIcon = { Icon(Icons.Filled.Search, null) },
+            trailingIcon = { if (query.isNotEmpty()) IconButton({ query = "" }) { Icon(Icons.Filled.Close, "Clear") } },
+            singleLine = true, shape = RoundedCornerShape(24.dp),
+            modifier = Modifier.fillMaxWidth().padding(12.dp)
         )
+        LazyColumn(Modifier.weight(1f)) {
+            if (searching && users.isEmpty() && posts.isEmpty())
+                item { Text("Searching…", Modifier.padding(16.dp), color = Color.Gray) }
+            if (!searching && searched.isNotEmpty() && users.isEmpty() && posts.isEmpty())
+                item { Text("Nothing found for “$searched”", Modifier.padding(16.dp), color = Color.Gray) }
+            if (users.isNotEmpty()) {
+                item { Text("People", fontWeight = FontWeight.Bold, modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp)) }
+                items(users, key = { "u" + it.username }) { u ->
+                    Row(
+                        Modifier.fillMaxWidth().clickable { ui.userView = u.username }.padding(horizontal = 16.dp, vertical = 8.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Avatar(u.username, u.avatar, Modifier.size(44.dp))
+                        Spacer(Modifier.width(12.dp))
+                        Column {
+                            Text(u.username, fontWeight = FontWeight.Bold)
+                            if (u.bio.isNotBlank()) Text(u.bio, color = Color.Gray, fontSize = 13.sp, maxLines = 1)
+                        }
+                    }
+                }
+            }
+            if (posts.isNotEmpty()) {
+                item { Text("Posts", fontWeight = FontWeight.Bold, modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp)) }
+                items(posts.filter { it.id !in ui.removed }, key = { "p" + it.id }) { p ->
+                    PostCard(p, vm, onComments = { ui.commentsFor = p }, onPhoto = { ui.photo = p.image },
+                        onEdit = { ui.editing = p }, onDelete = { ui.deleting = p }, onUser = { ui.userView = it })
+                }
+            }
+        }
     }
+    PostOverlays(vm, ui)
 }
 
 @Composable
-fun PostCard(p: Post, vm: AppVm, onComments: () -> Unit, onPhoto: () -> Unit, onEdit: () -> Unit, onDelete: () -> Unit) {
+fun PostCard(
+    p: Post, vm: AppVm, onComments: () -> Unit, onPhoto: () -> Unit,
+    onEdit: () -> Unit, onDelete: () -> Unit, onUser: (String) -> Unit
+) {
     var menu by remember { mutableStateOf(false) }
     Column(Modifier.padding(bottom = 12.dp)) {
         Row(Modifier.padding(start = 10.dp, top = 4.dp, bottom = 4.dp), verticalAlignment = Alignment.CenterVertically) {
-            Avatar(p.user, p.avatar, Modifier.size(32.dp))
-            Spacer(Modifier.width(8.dp))
-            Text(p.user, fontWeight = FontWeight.Bold, modifier = Modifier.weight(1f))
+            Row(Modifier.weight(1f).clickable { onUser(p.user) }, verticalAlignment = Alignment.CenterVertically) {
+                Avatar(p.user, p.avatar, Modifier.size(32.dp))
+                Spacer(Modifier.width(8.dp))
+                Text(p.user, fontWeight = FontWeight.Bold)
+            }
             if (p.user == vm.me?.username) {
                 Box {
                     IconButton({ menu = true }) { Icon(Icons.Filled.MoreVert, "More") }
@@ -515,10 +623,62 @@ fun PostCard(p: Post, vm: AppVm, onComments: () -> Unit, onPhoto: () -> Unit, on
     }
 }
 
+
+// ---------- Another user's profile ----------
+@Composable
+fun UserScreen(vm: AppVm, username: String, onClose: () -> Unit) {
+    var profile by remember { mutableStateOf<Profile?>(null) }
+    val posts = remember { mutableStateListOf<Post>() }
+    var loading by remember { mutableStateOf(true) }
+    var photo by remember { mutableStateOf<String?>(null) }
+    LaunchedEffect(username) {
+        try {
+            val (p, list) = vm.api.user(username)
+            profile = p; posts.clear(); posts.addAll(list)
+        } catch (e: Exception) { vm.toast(e.message) }
+        loading = false
+    }
+    Dialog(onDismissRequest = onClose, properties = DialogProperties(usePlatformDefaultWidth = false)) {
+        Surface(Modifier.fillMaxSize()) {
+            Column(Modifier.padding(top = 24.dp)) {
+                Row(Modifier.padding(horizontal = 8.dp), verticalAlignment = Alignment.CenterVertically) {
+                    IconButton(onClose) { Icon(Icons.Filled.Close, "Close") }
+                    Text(username, fontWeight = FontWeight.Bold, fontSize = 18.sp)
+                }
+                val p = profile
+                if (p == null) {
+                    Box(Modifier.fillMaxWidth().padding(32.dp), contentAlignment = Alignment.Center) {
+                        Text(if (loading) "Loading…" else "Couldn't load this profile", color = Color.Gray)
+                    }
+                } else {
+                    Row(Modifier.padding(16.dp), verticalAlignment = Alignment.CenterVertically) {
+                        Avatar(p.username, p.avatar, Modifier.size(80.dp))
+                        Spacer(Modifier.width(24.dp))
+                        Column {
+                            Text(p.username, fontSize = 20.sp, fontWeight = FontWeight.Bold)
+                            Text("${posts.size} posts  ·  ${posts.sumOf { it.likes }} likes", color = Color.Gray)
+                        }
+                    }
+                    if (p.bio.isNotBlank()) Text(p.bio, Modifier.padding(horizontal = 16.dp, vertical = 8.dp))
+                    HorizontalDivider()
+                    if (posts.isEmpty()) Text("No posts yet.", Modifier.padding(16.dp), color = Color.Gray)
+                    LazyVerticalGrid(GridCells.Fixed(3), horizontalArrangement = Arrangement.spacedBy(2.dp), verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                        items(posts, key = { it.id }) {
+                            AsyncImage(it.image, null, contentScale = ContentScale.Crop,
+                                modifier = Modifier.aspectRatio(1f).clickable { photo = it.image })
+                        }
+                    }
+                }
+            }
+            photo?.let { PhotoViewer(it) { photo = null } }
+        }
+    }
+}
+
 // ---------- Comments ----------
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun CommentsSheet(p: Post, vm: AppVm, onClose: () -> Unit) {
+fun CommentsSheet(p: Post, vm: AppVm, onUser: (String) -> Unit, onClose: () -> Unit) {
     var text by remember { mutableStateOf("") }
     var loading by remember { mutableStateOf(true) }
     val comments = remember { mutableStateListOf<Comment>() }
@@ -538,7 +698,7 @@ fun CommentsSheet(p: Post, vm: AppVm, onClose: () -> Unit) {
             } else {
                 LazyColumn(Modifier.weight(1f), contentPadding = PaddingValues(16.dp), verticalArrangement = Arrangement.spacedBy(16.dp)) {
                     items(comments) { c ->
-                        Row {
+                        Row(Modifier.clickable { onUser(c.user) }) {
                             Avatar(c.user, c.avatar, Modifier.size(36.dp))
                             Spacer(Modifier.width(12.dp))
                             Column {
@@ -611,7 +771,7 @@ fun ProfileScreen(vm: AppVm) {
             Avatar(me.username, me.avatar, Modifier.size(80.dp))
             Spacer(Modifier.width(24.dp))
             Column(Modifier.weight(1f)) {
-                Text(me.username, fontSize = 20.sp, fontWeight = FontWeight.Bold)
+                Text(if (me.vip) "${me.username}  ⭐ VIP" else me.username, fontSize = 20.sp, fontWeight = FontWeight.Bold)
                 Text("${mine.size} posts  ·  ${mine.sumOf { it.likes }} likes", color = Color.Gray)
             }
             TextButton({ vm.logout() }) { Text("Log out") }

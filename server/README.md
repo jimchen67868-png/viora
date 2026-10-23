@@ -10,3 +10,11 @@ Sent through Brevo's HTTPS API (Render's free tier blocks SMTP ports). Environme
 - `BREVO_API_KEY` - Brevo -> SMTP & API -> API keys
 - `MAIL_FROM`     - a sender address you verified in Brevo (Senders & IP -> Senders)
 For local testing set `MAIL_DEBUG=1` and codes are printed to the server log instead of emailed.
+
+## VIP users
+Set `ADMIN_KEY` (any long secret) in the environment, then grant/revoke VIP from any terminal:
+
+    curl -X POST https://YOUR-SERVER/api/admin/vip -H "X-Admin-Key: YOUR_KEY" \
+         -H "Content-Type: application/json" -d '{"username":"alice","vip":true}'
+
+VIPs get the "For you" feed: posts ranked by the authors, words and #hashtags of posts they liked.
