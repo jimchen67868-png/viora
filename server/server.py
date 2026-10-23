@@ -145,8 +145,11 @@ def stripe_api(method, path, params=None):
     try:
         return json.loads(urllib.request.urlopen(req, timeout=20).read())
     except urllib.error.HTTPError as e:
-        print("stripe error:", e.code, e.read()[:500], flush=True)
-        raise HTTPError(502, "The payment provider rejected the request")
+        body = e.read()
+        print("stripe error:", e.code, body[:500], flush=True)
+        try: detail = json.loads(body)["error"]["message"][:200]
+        except Exception: detail = ""
+        raise HTTPError(502, "The payment provider rejected the request" + (f": {detail}" if detail else ""))
     except Exception:
         traceback.print_exc()
         raise HTTPError(502, "Couldn't reach the payment provider")
