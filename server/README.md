@@ -18,3 +18,10 @@ Set `ADMIN_KEY` (any long secret) in the environment, then grant/revoke VIP from
          -H "Content-Type: application/json" -d '{"username":"alice","vip":true}'
 
 VIPs get the "For you" feed: posts ranked by the authors, words and #hashtags of posts they liked.
+
+## VIP subscriptions (Stripe Checkout)
+Env: `STRIPE_SECRET_KEY` (sk_...), `STRIPE_WEBHOOK_SECRET` (whsec_...), `STRIPE_PRICE_MONTHLY` / `STRIPE_PRICE_YEARLY`
+(price_... ids; set one or both), optional `PLAN_MONTHLY_TEXT` / `PLAN_YEARLY_TEXT` (label shown in the app).
+Webhook endpoint: `https://YOUR-SERVER/api/stripe/webhook` with events
+`checkout.session.completed`, `customer.subscription.created`, `customer.subscription.updated`, `customer.subscription.deleted`.
+Enable the Customer Portal in the Stripe dashboard so subscribers can cancel/update their card ("Manage" button).

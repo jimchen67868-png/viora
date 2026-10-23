@@ -2,7 +2,7 @@
 """Viora server: REST API + image hosting. Pure Python 3.8+ standard library, SQLite storage.
 Run:  python3 server.py   (env: PORT=8000, DATABASE_URL=postgres://... or VIORA_DATA=./data for SQLite)
 """
-import hashlib, hmac, json, math, os, re, secrets, sqlite3, time, traceback, urllib.request
+import hashlib, hmac, json, math, os, re, secrets, sqlite3, time, traceback, urllib.error, urllib.parse, urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
@@ -56,7 +56,7 @@ def db(): return DB()
 
 with db() as _c:
     for _s in SCHEMA: _c.execute(_s)
-for _col, _typ in (("email", "TEXT"), ("email_verified", "INTEGER NOT NULL DEFAULT 0"), ("is_vip", "INTEGER NOT NULL DEFAULT 0")):
+for _col, _typ in (("email", "TEXT"), ("email_verified", "INTEGER NOT NULL DEFAULT 0"), ("is_vip", "INTEGER NOT NULL DEFAULT 0"), ("vip_until", "DOUBLE PRECISION"), ("stripe_customer", "TEXT")):
     try:  # add columns to databases created before email support existed
         with db() as _c: _c.execute(f"ALTER TABLE users ADD COLUMN {'IF NOT EXISTS ' if PG else ''}{_col} {_typ}")
     except Exception:
@@ -131,6 +131,66 @@ def check_code(c, uid, kind, code):
         raise HTTPError(400, "Wrong code")
     return r["email"]
 
+def vip_active(u):
+    """VIP = granted by admin (lifetime) or an active paid subscription."""
+    return bool(u["is_vip"]) or (u["vip_until"] or 0) > time.time()
+
+# ---- Stripe (plain HTTPS, no SDK) ----
+def stripe_api(method, path, params=None):
+    key = os.environ.get("STRIPE_SECRET_KEY")
+    if not key: raise HTTPError(503, "Payments are not set up on this server yet")
+    req = urllib.request.Request("https://api.stripe.com" + path, method=method,
+                                 data=urllib.parse.urlencode(params).encode() if params else None,
+                                 headers={"Authorization": "Bearer " + key})
+    try:
+        return json.loads(urllib.request.urlopen(req, timeout=20).read())
+    except urllib.error.HTTPError as e:
+        print("stripe error:", e.code, e.read()[:500], flush=True)
+        raise HTTPError(502, "The payment provider rejected the request")
+    except Exception:
+        traceback.print_exc()
+        raise HTTPError(502, "Couldn't reach the payment provider")
+
+def plan_list():
+    if not os.environ.get("STRIPE_SECRET_KEY"): return []
+    out = []
+    for pid, name in (("monthly", "Monthly"), ("yearly", "Yearly")):
+        price = os.environ.get(f"STRIPE_PRICE_{pid.upper()}")
+        if price: out.append({"id": pid, "name": name, "price_id": price, "price": os.environ.get(f"PLAN_{pid.upper()}_TEXT", "")})
+    return out
+
+def verify_stripe_signature(h, raw):
+    secret = os.environ.get("STRIPE_WEBHOOK_SECRET", "")
+    ts, sigs = None, []
+    for kv in h.headers.get("Stripe-Signature", "").split(","):
+        k, _, v = kv.partition("=")
+        if k.strip() == "t": ts = v.strip()
+        elif k.strip() == "v1": sigs.append(v.strip())
+    if not secret or not ts or not sigs: return False
+    try:
+        if abs(time.time() - int(ts)) > 300: return False
+    except ValueError:
+        return False
+    expected = hmac.new(secret.encode(), ts.encode() + b"." + raw, hashlib.sha256).hexdigest()
+    return any(hmac.compare_digest(expected, x) for x in sigs)
+
+def sub_period_end(sub):
+    """Stripe's newer API versions keep the period end on each subscription item; older ones on the subscription."""
+    ends = [it.get("current_period_end") for it in ((sub.get("items") or {}).get("data") or []) if it.get("current_period_end")]
+    if sub.get("current_period_end"): ends.append(sub["current_period_end"])
+    return max(ends) if ends else None
+
+def apply_subscription(c, sub):
+    uid, cust = (sub.get("metadata") or {}).get("user_id"), sub.get("customer")
+    row = None
+    if uid and str(uid).isdigit(): row = c.execute("SELECT id FROM users WHERE id=?", (int(uid),)).fetchone()
+    if not row and cust: row = c.execute("SELECT id FROM users WHERE stripe_customer=?", (cust,)).fetchone()
+    if not row:
+        print("stripe: subscription for unknown user", sub.get("id"), flush=True); return
+    paid = sub.get("status") in ("active", "trialing", "past_due")
+    end = float(sub_period_end(sub)) if paid and sub_period_end(sub) else None
+    c.execute("UPDATE users SET vip_until=?, stripe_customer=COALESCE(?, stripe_customer) WHERE id=?", (end, cust, row["id"]))
+
 ROUTES = []
 def route(method, pattern):
     def deco(fn):
@@ -168,6 +228,17 @@ class H(BaseHTTPRequestHandler):
         if not r: raise HTTPError(401, "Session expired, please sign in again")
         return r
 
+    def origin(self):
+        return f"{self.headers.get('X-Forwarded-Proto', 'http')}://{self.headers.get('Host', 'localhost')}"
+
+    def send_html(self, code, html):
+        body = html.encode()
+        self.send_response(code)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
     def url(self, f):
         if not f: return None
         proto = self.headers.get("X-Forwarded-Proto", "http")
@@ -175,7 +246,8 @@ class H(BaseHTTPRequestHandler):
 
     def profile(self, u):
         return {"username": u["username"], "bio": u["bio"], "avatar": self.url(u["avatar"]),
-                "email": u["email"], "email_verified": bool(u["email_verified"]), "vip": bool(u["is_vip"])}
+                "email": u["email"], "email_verified": bool(u["email_verified"]), "vip": vip_active(u),
+                "vip_until": (u["vip_until"] if not u["is_vip"] and (u["vip_until"] or 0) > time.time() else None)}
 
     def post_json(self, c, uid, where="", args=(), limit=100):
         rows = c.execute(f"""SELECT p.id, p.caption, p.image, u.username, u.avatar,
@@ -409,7 +481,7 @@ def for_you(h, q):
     """VIP-only feed ranked by similarity to what the user has liked: same authors and shared words/#hashtags."""
     with db() as c:
         u = h.user(c)
-        if not u["is_vip"]: raise HTTPError(403, "For You is a VIP feature")
+        if not vip_active(u): raise HTTPError(403, "For You is a VIP feature")
         liked = c.execute("""SELECT au.username, p.caption FROM likes l JOIN posts p ON p.id=l.post_id
                              JOIN users au ON au.id=p.user_id WHERE l.user_id=? ORDER BY p.id DESC LIMIT 100""", (u["id"],)).fetchall()
         authors, kw = {}, {}
@@ -437,6 +509,62 @@ def set_vip(h, q):
         if not c.execute("UPDATE users SET is_vip=? WHERE LOWER(username)=LOWER(?)", (vip, name)).rowcount:
             raise HTTPError(404, "User not found")
     h.send_json(200, {"ok": True, "username": name, "vip": bool(vip)})
+
+@route("GET", "/api/plans")
+def plans(h, q):
+    with db() as c: h.user(c)
+    h.send_json(200, {"plans": [{k: p[k] for k in ("id", "name", "price")} for p in plan_list()]})
+
+@route("POST", "/api/billing/checkout")
+def checkout(h, q):
+    plan = str(h.json_body().get("plan", ""))
+    with db() as c:
+        u = h.user(c)
+        if u["is_vip"]: raise HTTPError(400, "Your account already has VIP")
+        if (u["vip_until"] or 0) > time.time(): raise HTTPError(400, "You already have an active subscription. Use Manage.")
+        email = u["email"] if u["email_verified"] else None
+    chosen = next((p for p in plan_list() if p["id"] == plan), None)
+    if not chosen: raise HTTPError(503 if not os.environ.get("STRIPE_SECRET_KEY") else 400, "That plan isn't available")
+    params = {"mode": "subscription", "line_items[0][price]": chosen["price_id"], "line_items[0][quantity]": "1",
+              "client_reference_id": str(u["id"]), "subscription_data[metadata][user_id]": str(u["id"]),
+              "success_url": h.origin() + "/billing/return", "cancel_url": h.origin() + "/billing/return"}
+    if u["stripe_customer"]: params["customer"] = u["stripe_customer"]
+    elif email: params["customer_email"] = email
+    session = stripe_api("POST", "/v1/checkout/sessions", params)
+    h.send_json(200, {"url": session["url"]})
+
+@route("POST", "/api/billing/portal")
+def portal(h, q):
+    with db() as c: u = h.user(c)
+    if not u["stripe_customer"]: raise HTTPError(400, "No subscription found for this account")
+    s = stripe_api("POST", "/v1/billing_portal/sessions", {"customer": u["stripe_customer"], "return_url": h.origin() + "/billing/return"})
+    h.send_json(200, {"url": s["url"]})
+
+@route("GET", "/billing/return")
+def billing_return(h, q):
+    h.send_html(200, "<!doctype html><meta name=viewport content='width=device-width,initial-scale=1'>"
+                     "<body style='font-family:sans-serif;text-align:center;padding:3rem 1rem'>"
+                     "<h2>All set</h2><p>You can close this page and return to the Viora app.</p>")
+
+@route("POST", "/api/stripe/webhook")
+def stripe_webhook(h, q):
+    raw = h.body()
+    if not verify_stripe_signature(h, raw): raise HTTPError(400, "Bad signature")
+    try:
+        event = json.loads(raw); kind = event["type"]; obj = event["data"]["object"]
+    except (ValueError, KeyError):
+        raise HTTPError(400, "Bad event")
+    with db() as c:
+        if kind == "checkout.session.completed":
+            uid, cust, subid = obj.get("client_reference_id"), obj.get("customer"), obj.get("subscription")
+            if uid and str(uid).isdigit() and cust:
+                c.execute("UPDATE users SET stripe_customer=? WHERE id=?", (cust, int(uid)))
+            if subid:
+                try: apply_subscription(c, stripe_api("GET", f"/v1/subscriptions/{subid}"))
+                except HTTPError as e: print("stripe: couldn't fetch subscription:", e.msg, flush=True)
+        elif kind in ("customer.subscription.created", "customer.subscription.updated", "customer.subscription.deleted"):
+            apply_subscription(c, obj)
+    h.send_json(200, {"received": True})
 
 @route("GET", "/api/posts")
 def list_posts(h, q):

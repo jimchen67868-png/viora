@@ -17,3 +17,15 @@ services:
         sync: false
       - key: ADMIN_KEY
         sync: false
+      - key: STRIPE_SECRET_KEY
+        sync: false
+      - key: STRIPE_WEBHOOK_SECRET
+        sync: false
+      - key: STRIPE_PRICE_MONTHLY
+        sync: false
+      - key: STRIPE_PRICE_YEARLY
+        sync: false
+      - key: PLAN_MONTHLY_TEXT
+        value: "$4.99 / month"
+      - key: PLAN_YEARLY_TEXT
+        value: "$39.99 / year"

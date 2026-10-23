@@ -29,8 +29,9 @@ class ApiException(val code: Int, message: String) : Exception(message)
 
 class Profile(
     val username: String, val bio: String, val avatar: String?,
-    val email: String? = null, val emailVerified: Boolean = false, val vip: Boolean = false
+    val email: String? = null, val emailVerified: Boolean = false, val vip: Boolean = false, val vipUntil: Long? = null
 )
+class Plan(val id: String, val name: String, val price: String)
 class Comment(val user: String, val avatar: String?, val text: String)
 class Story(val user: String, val avatar: String?, val images: List<String>)
 
@@ -46,7 +47,8 @@ class Post(
 
 private fun JSONObject.str(k: String): String? = if (isNull(k)) null else getString(k)
 private fun JSONObject.toProfile() =
-    Profile(getString("username"), optString("bio", ""), str("avatar"), str("email"), optBoolean("email_verified", false), optBoolean("vip", false))
+    Profile(getString("username"), optString("bio", ""), str("avatar"), str("email"), optBoolean("email_verified", false), optBoolean("vip", false),
+        if (has("vip_until") && !isNull("vip_until")) getLong("vip_until") else null)
 private fun JSONObject.toComment() = Comment(getString("user"), str("avatar"), getString("text"))
 private fun JSONObject.toPost() = Post(
     getInt("id"), getString("user"), str("avatar"), getString("image"),
@@ -112,6 +114,12 @@ class Api(var base: String, var token: String?) {
         val a = j.getJSONArray("posts")
         return List(a.length()) { a.getJSONObject(it).toPost() } to j.optBoolean("personalized", false)
     }
+    suspend fun plans(): List<Plan> {
+        val a = send("GET", "/api/plans").getJSONArray("plans")
+        return List(a.length()) { val o = a.getJSONObject(it); Plan(o.getString("id"), o.getString("name"), o.optString("price", "")) }
+    }
+    suspend fun checkout(plan: String) = send("POST", "/api/billing/checkout", json("plan" to plan)).getString("url")
+    suspend fun portal() = send("POST", "/api/billing/portal").getString("url")
     suspend fun createPost(img: ByteArray, caption: String) =
         send("POST", "/api/posts?caption=" + enc(caption), img.toRequestBody(JPEG)).getJSONObject("post").toPost()
     suspend fun editPost(id: Int, caption: String) { send("PUT", "/api/posts/$id", json("caption" to caption)) }

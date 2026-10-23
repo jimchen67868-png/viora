@@ -2,10 +2,12 @@ package com.example.viora
 
 import android.app.Application
 import android.content.Context
+import android.content.Intent
 import android.net.Uri
 import android.os.Bundle
 import android.widget.Toast
 import androidx.activity.ComponentActivity
+import androidx.activity.viewModels
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.result.PickVisualMediaRequest
@@ -59,6 +61,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.withStyle
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.window.Dialog
@@ -67,6 +70,8 @@ import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import androidx.lifecycle.viewmodel.compose.viewModel
 import coil.compose.AsyncImage
+import java.text.DateFormat
+import java.util.Date
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
@@ -187,6 +192,12 @@ class AppVm(app: Application) : AndroidViewModel(app) {
         try { api.resetPassword(email, code, pw); toast("Password changed. Please log in."); ok() } finally { busy = false }
     }
 
+    fun startCheckout(plan: String, open: (String) -> Unit) = safe {
+        busy = true
+        try { open(api.checkout(plan)) } finally { busy = false }
+    }
+    fun openPortal(open: (String) -> Unit) = safe { open(api.portal()) }
+
     fun saveProfile(username: String, bio: String, newAvatar: Uri?, removeAvatar: Boolean) = safe {
         busy = true
         try {
@@ -202,9 +213,18 @@ class AppVm(app: Application) : AndroidViewModel(app) {
 
 // ---------- Activity ----------
 class MainActivity : ComponentActivity() {
+    private val vm: AppVm by viewModels()
+    private var firstResume = true
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContent { MaterialTheme { Surface { App() } } }
+    }
+
+    // Coming back from the payment page: reload the profile so VIP shows up.
+    override fun onResume() {
+        super.onResume()
+        if (firstResume) firstResume = false else if (vm.me != null) vm.refresh()
     }
 }
 
@@ -333,6 +353,39 @@ fun EmailDialog(vm: AppVm, onClose: () -> Unit) {
                 TextButton(onClose) { Text("Close") }
             }
         }
+    )
+}
+
+
+fun fmtDate(epochSeconds: Long): String = DateFormat.getDateInstance(DateFormat.MEDIUM).format(Date(epochSeconds * 1000))
+
+@Composable
+fun VipDialog(vm: AppVm, onClose: () -> Unit) {
+    val ctx = LocalContext.current
+    var plans by remember { mutableStateOf<List<Plan>?>(null) }
+    LaunchedEffect(Unit) {
+        try { plans = vm.api.plans() } catch (e: Exception) { vm.toast(e.message); plans = emptyList() }
+    }
+    AlertDialog(
+        onDismissRequest = onClose,
+        title = { Text("⭐ Viora VIP") },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                Text("Get a personalised “For you” feed based on the posts you like.", color = Color.Gray, fontSize = 13.sp)
+                val list = plans
+                if (list == null) Text("Loading plans…")
+                else if (list.isEmpty()) Text("Subscriptions aren't available yet.", color = Color.Gray)
+                else list.forEach { plan ->
+                    Button(
+                        onClick = { vm.startCheckout(plan.id) { url -> ctx.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(url))); onClose() } },
+                        enabled = !vm.busy, modifier = Modifier.fillMaxWidth()
+                    ) { Text(if (plan.price.isBlank()) plan.name else "${plan.name} · ${plan.price}") }
+                }
+                Text("Secure payment by Stripe. Cancel any time with Manage.", color = Color.Gray, fontSize = 12.sp)
+            }
+        },
+        confirmButton = {},
+        dismissButton = { TextButton(onClose) { Text("Not now") } }
     )
 }
 
@@ -758,6 +811,8 @@ fun ProfileScreen(vm: AppVm) {
     var photo by remember { mutableStateOf<String?>(null) }
     var editing by remember { mutableStateOf(false) }
     var emailOpen by remember { mutableStateOf(false) }
+    var vipOpen by remember { mutableStateOf(false) }
+    val ctx = LocalContext.current
     var draftName by remember { mutableStateOf("") }
     var draftBio by remember { mutableStateOf("") }
     var draftAvatar by remember { mutableStateOf<Uri?>(null) }
@@ -788,6 +843,18 @@ fun ProfileScreen(vm: AppVm) {
             fontSize = 13.sp,
             modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp).clickable { emailOpen = true }
         )
+        if (me.vip) {
+            Row(Modifier.padding(horizontal = 16.dp), verticalAlignment = Alignment.CenterVertically) {
+                Text(
+                    if (me.vipUntil != null) "⭐ VIP until ${fmtDate(me.vipUntil)}" else "⭐ VIP",
+                    color = Color(0xFFB45309), fontSize = 13.sp, modifier = Modifier.weight(1f)
+                )
+                if (me.vipUntil != null)
+                    TextButton({ vm.openPortal { url -> ctx.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(url))) } }) { Text("Manage") }
+            }
+        } else {
+            Button({ vipOpen = true }, Modifier.padding(horizontal = 16.dp)) { Text("⭐ Get VIP") }
+        }
         OutlinedButton(
             onClick = { draftName = me.username; draftBio = me.bio; draftAvatar = null; removing = false; editing = true },
             modifier = Modifier.fillMaxWidth().padding(16.dp)
@@ -803,6 +870,7 @@ fun ProfileScreen(vm: AppVm) {
     }
     photo?.let { PhotoViewer(it) { photo = null } }
     if (emailOpen) EmailDialog(vm) { emailOpen = false }
+    if (vipOpen) VipDialog(vm) { vipOpen = false }
 
     if (editing) {
         AlertDialog(
