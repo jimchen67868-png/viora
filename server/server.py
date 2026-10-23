@@ -530,7 +530,14 @@ def checkout(h, q):
               "success_url": h.origin() + "/billing/return", "cancel_url": h.origin() + "/billing/return"}
     if u["stripe_customer"]: params["customer"] = u["stripe_customer"]
     elif email: params["customer_email"] = email
-    session = stripe_api("POST", "/v1/checkout/sessions", params)
+    try:
+        session = stripe_api("POST", "/v1/checkout/sessions", params)
+    except HTTPError:
+        if "customer" not in params: raise
+        # a customer id saved in test mode doesn't exist in live mode: retry as a new customer
+        del params["customer"]
+        if email: params["customer_email"] = email
+        session = stripe_api("POST", "/v1/checkout/sessions", params)
     h.send_json(200, {"url": session["url"]})
 
 @route("POST", "/api/billing/portal")

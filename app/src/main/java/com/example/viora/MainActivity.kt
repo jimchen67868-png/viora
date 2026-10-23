@@ -72,6 +72,7 @@ import androidx.lifecycle.viewmodel.compose.viewModel
 import coil.compose.AsyncImage
 import java.text.DateFormat
 import java.util.Date
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
@@ -102,6 +103,7 @@ class AppVm(app: Application) : AndroidViewModel(app) {
     private fun safe(block: suspend () -> Unit) = viewModelScope.launch {
         try { block() }
         catch (e: ApiException) { if (e.code == 401) logout(); toast(e.message) }
+        catch (e: CancellationException) { throw e }
         catch (e: Exception) { toast(e.message ?: "Can't reach the server") }
     }
 
@@ -364,7 +366,9 @@ fun VipDialog(vm: AppVm, onClose: () -> Unit) {
     val ctx = LocalContext.current
     var plans by remember { mutableStateOf<List<Plan>?>(null) }
     LaunchedEffect(Unit) {
-        try { plans = vm.api.plans() } catch (e: Exception) { vm.toast(e.message); plans = emptyList() }
+        try { plans = vm.api.plans() }
+        catch (e: CancellationException) { throw e }
+        catch (e: Exception) { vm.toast(e.message); plans = emptyList() }
     }
     AlertDialog(
         onDismissRequest = onClose,
@@ -576,8 +580,9 @@ fun SearchScreen(vm: AppVm) {
         try {
             val (u, p) = vm.api.search(term)
             users = u; posts = p; searched = term
-        } catch (e: Exception) { vm.toast(e.message) }
-        searching = false
+        } catch (e: CancellationException) { throw e }
+        catch (e: Exception) { vm.toast(e.message) }
+        finally { searching = false }
     }
 
     Column(Modifier.fillMaxSize()) {
@@ -688,7 +693,8 @@ fun UserScreen(vm: AppVm, username: String, onClose: () -> Unit) {
         try {
             val (p, list) = vm.api.user(username)
             profile = p; posts.clear(); posts.addAll(list)
-        } catch (e: Exception) { vm.toast(e.message) }
+        } catch (e: CancellationException) { throw e }
+        catch (e: Exception) { vm.toast(e.message) }
         loading = false
     }
     Dialog(onDismissRequest = onClose, properties = DialogProperties(usePlatformDefaultWidth = false)) {
@@ -736,7 +742,9 @@ fun CommentsSheet(p: Post, vm: AppVm, onUser: (String) -> Unit, onClose: () -> U
     var loading by remember { mutableStateOf(true) }
     val comments = remember { mutableStateListOf<Comment>() }
     LaunchedEffect(p.id) {
-        try { comments.addAll(vm.api.comments(p.id)) } catch (_: Exception) { }
+        try { comments.addAll(vm.api.comments(p.id)) }
+        catch (e: CancellationException) { throw e }
+        catch (_: Exception) { }
         loading = false
     }
     ModalBottomSheet(onDismissRequest = onClose, sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)) {
