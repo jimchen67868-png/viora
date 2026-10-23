@@ -8,6 +8,7 @@ import android.os.Bundle
 import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.viewModels
+import androidx.browser.customtabs.CustomTabsIntent
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.result.PickVisualMediaRequest
@@ -359,6 +360,12 @@ fun EmailDialog(vm: AppVm, onClose: () -> Unit) {
 }
 
 
+/** Opens a web page in a Chrome Custom Tab (Chrome is where Google Pay shows up); falls back to any browser. */
+fun openWeb(ctx: Context, url: String) {
+    try { CustomTabsIntent.Builder().build().launchUrl(ctx, Uri.parse(url)) }
+    catch (e: Exception) { ctx.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(url))) }
+}
+
 fun fmtDate(epochSeconds: Long): String = DateFormat.getDateInstance(DateFormat.MEDIUM).format(Date(epochSeconds * 1000))
 
 @Composable
@@ -381,7 +388,7 @@ fun VipDialog(vm: AppVm, onClose: () -> Unit) {
                 else if (list.isEmpty()) Text("Subscriptions aren't available yet.", color = Color.Gray)
                 else list.forEach { plan ->
                     Button(
-                        onClick = { vm.startCheckout(plan.id) { url -> ctx.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(url))); onClose() } },
+                        onClick = { vm.startCheckout(plan.id) { url -> openWeb(ctx, url); onClose() } },
                         enabled = !vm.busy, modifier = Modifier.fillMaxWidth()
                     ) { Text(if (plan.price.isBlank()) plan.name else "${plan.name} · ${plan.price}") }
                 }
@@ -858,7 +865,7 @@ fun ProfileScreen(vm: AppVm) {
                     color = Color(0xFFB45309), fontSize = 13.sp, modifier = Modifier.weight(1f)
                 )
                 if (me.vipUntil != null)
-                    TextButton({ vm.openPortal { url -> ctx.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(url))) } }) { Text("Manage") }
+                    TextButton({ vm.openPortal { url -> openWeb(ctx, url) } }) { Text("Manage") }
             }
         } else {
             Button({ vipOpen = true }, Modifier.padding(horizontal = 16.dp)) { Text("⭐ Get VIP") }
