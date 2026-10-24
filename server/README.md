@@ -39,3 +39,9 @@ Set `OPENAI_API_KEY` and every uploaded photo (posts, stories, profile photos) i
 `omni-moderation-latest` model before it is saved; photos scored as sexual are rejected (HTTP 422). Optional:
 `MODERATION_THRESHOLD` (default 0.5; lower = stricter). If the check can't run, the upload is refused.
 Without the key, moderation is off.
+
+## Video posts
+Clips (MP4, max 30 s / 20 MB, compressed on the phone) are stored in the database next to photos and streamed with byte-range support.
+On upload the server samples 6 frames, runs them through the same photo moderation, and saves the middle frame as the poster.
+Frame sampling uses PyAV (installed from requirements.txt) or, if PyAV is missing, the `ffmpeg`/`ffprobe` command-line tools.
+Without either, video uploads are refused. Stories remain photo-only.

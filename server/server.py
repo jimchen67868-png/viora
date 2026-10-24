@@ -2,7 +2,7 @@
 """Viora server: REST API + image hosting. Pure Python 3.8+ standard library, SQLite storage.
 Run:  python3 server.py   (env: PORT=8000, DATABASE_URL=postgres://... or VIORA_DATA=./data for SQLite)
 """
-import base64, datetime, hashlib, hmac, json, math, os, re, secrets, sqlite3, time, traceback, urllib.error, urllib.parse, urllib.request
+import base64, datetime, hashlib, hmac, io, json, math, os, re, secrets, shutil, sqlite3, subprocess, tempfile, time, traceback, urllib.error, urllib.parse, urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
@@ -15,7 +15,10 @@ if PG:
     import psycopg2, psycopg2.extras
 DATA = os.environ.get("VIORA_DATA", "data")
 DB_FILE = os.path.join(DATA, "viora.db")
-MAX_BODY = 12 * 1024 * 1024
+MAX_BODY = 25 * 1024 * 1024        # request size cap (videos)
+MAX_IMAGE_BYTES = 12 * 1024 * 1024
+MAX_VIDEO_BYTES = 20 * 1024 * 1024
+MAX_VIDEO_SECONDS = 30
 STORY_TTL = 24 * 3600
 if not PG: os.makedirs(DATA, exist_ok=True)
 
@@ -62,6 +65,11 @@ for _col, _typ in (("email", "TEXT"), ("email_verified", "INTEGER NOT NULL DEFAU
         with db() as _c: _c.execute(f"ALTER TABLE users ADD COLUMN {'IF NOT EXISTS ' if PG else ''}{_col} {_typ}")
     except Exception:
         pass
+for _col, _typ in (("kind", "TEXT NOT NULL DEFAULT 'image'"), ("thumb", "TEXT")):
+    try:  # video posts: kind + poster image
+        with db() as _c: _c.execute(f"ALTER TABLE posts ADD COLUMN {'IF NOT EXISTS ' if PG else ''}{_col} {_typ}")
+    except Exception:
+        pass
 with db() as _c:  # an email can belong to only one account once verified
     _c.execute("CREATE UNIQUE INDEX IF NOT EXISTS users_email ON users(LOWER(email)) WHERE email_verified=1")
 
@@ -79,31 +87,86 @@ def sniff(b):
     if b[:4] == b"GIF8": return "image/gif"
     return None
 
-def moderate_image(data, ctype):
-    """Blocks sexual content using OpenAI's free moderation endpoint (omni-moderation-latest supports images).
-    Off unless OPENAI_API_KEY is set. If the check itself fails, the upload is refused (fail closed)."""
+def moderate_images(items):
+    """items: list of (bytes, content_type). Blocks sexual content using OpenAI's free moderation endpoint
+    (omni-moderation-latest supports images). Off unless OPENAI_API_KEY is set; if the check fails, refuse (fail closed)."""
     key = os.environ.get("OPENAI_API_KEY")
-    if not key: return
+    if not key or not items: return
     url = os.environ.get("MODERATION_URL", "https://api.openai.com/v1/moderations")
     threshold = float(os.environ.get("MODERATION_THRESHOLD", "0.5"))
     body = json.dumps({"model": "omni-moderation-latest", "input": [
-        {"type": "image_url", "image_url": {"url": f"data:{ctype};base64,{base64.b64encode(data).decode()}"}}]}).encode()
+        {"type": "image_url", "image_url": {"url": f"data:{ct};base64,{base64.b64encode(d).decode()}"}} for d, ct in items]}).encode()
     req = urllib.request.Request(url, data=body, headers={"Authorization": "Bearer " + key, "Content-Type": "application/json"})
     try:
-        res = json.loads(urllib.request.urlopen(req, timeout=25).read())["results"][0]
+        results = json.loads(urllib.request.urlopen(req, timeout=40).read())["results"]
     except Exception:
         traceback.print_exc()
-        raise HTTPError(503, "Couldn't check this photo right now. Please try again in a moment.")
-    if res["categories"].get("sexual") or res["category_scores"].get("sexual", 0) >= threshold:
-        print("moderation: blocked an image, sexual score", res["category_scores"].get("sexual"), flush=True)
-        raise HTTPError(422, "This photo looks like it contains sexual content, so it can't be posted.")
+        raise HTTPError(503, "Couldn't check this file right now. Please try again in a moment.")
+    for res in results:
+        if res["categories"].get("sexual") or res["category_scores"].get("sexual", 0) >= threshold:
+            print("moderation: blocked a file, sexual score", res["category_scores"].get("sexual"), flush=True)
+            raise HTTPError(422, "This looks like it contains sexual content, so it can't be posted.")
+
+def moderate_image(data, ctype):
+    moderate_images([(data, ctype)])
+
+# ---- video: frame sampling (PyAV if installed, else the ffmpeg command-line tools) ----
+def _frames_pyav(data, n):
+    import av
+    out = []
+    with av.open(io.BytesIO(data)) as container:
+        if not container.streams.video: raise ValueError("no video stream")
+        duration = container.duration / av.time_base if container.duration else None
+        if not duration: raise ValueError("unknown duration")
+        for i in range(n):
+            container.seek(int(duration * (i + 0.5) / n * av.time_base))
+            for frame in container.decode(video=0):
+                img = frame.to_image(); img.thumbnail((640, 640))
+                buf = io.BytesIO(); img.convert("RGB").save(buf, "JPEG", quality=80); out.append(buf.getvalue())
+                break
+    return out, duration
+
+def _frames_ffmpeg(data, n):
+    with tempfile.NamedTemporaryFile(suffix=".mp4") as f:
+        f.write(data); f.flush()
+        probe = subprocess.run(["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "default=nw=1:nk=1", f.name],
+                               capture_output=True, text=True, timeout=20)
+        duration = float(probe.stdout.strip())
+        out = []
+        for i in range(n):
+            t = duration * (i + 0.5) / n
+            r = subprocess.run(["ffmpeg", "-v", "error", "-ss", f"{t:.2f}", "-i", f.name, "-frames:v", "1",
+                                "-vf", "scale='min(640,iw)':-2", "-f", "image2pipe", "-c:v", "mjpeg", "-q:v", "5", "pipe:1"],
+                               capture_output=True, timeout=30)
+            if r.stdout: out.append(r.stdout)
+    return out, duration
+
+def video_frames(data, n=6):
+    try:
+        try:
+            import av  # noqa: F401
+            frames, duration = _frames_pyav(data, n)
+        except ImportError:
+            if not shutil.which("ffmpeg"): raise HTTPError(503, "Video uploads aren't enabled on this server")
+            frames, duration = _frames_ffmpeg(data, n)
+    except HTTPError:
+        raise
+    except Exception:
+        traceback.print_exc()
+        raise HTTPError(400, "Couldn't read this video. Try a different file.")
+    if not frames: raise HTTPError(400, "Couldn't read this video. Try a different file.")
+    if duration > MAX_VIDEO_SECONDS + 2: raise HTTPError(400, f"Videos can be at most {MAX_VIDEO_SECONDS} seconds")
+    return frames, duration
+
+def store_media(c, data, ctype):
+    blob = psycopg2.Binary(data) if PG else data
+    return str(c.execute("INSERT INTO images(ctype,data) VALUES(?,?) RETURNING id", (ctype, blob)).fetchone()["id"])
 
 def save_image(c, b):
     ctype = sniff(b)
-    if not ctype: raise HTTPError(400, "Unsupported or empty image")
-    moderate_image(b, ctype)
-    data = psycopg2.Binary(b) if PG else b
-    return str(c.execute("INSERT INTO images(ctype,data) VALUES(?,?) RETURNING id", (ctype, data)).fetchone()["id"])
+    if not ctype or len(b) > MAX_IMAGE_BYTES: raise HTTPError(400, "Unsupported, empty or too large image")
+    moderate_images([(b, ctype)])
+    return store_media(c, b, ctype)
 
 def remove_image(c, name):
     if name and str(name).isdigit(): c.execute("DELETE FROM images WHERE id=?", (int(name),))
@@ -352,13 +415,13 @@ class H(BaseHTTPRequestHandler):
                 "vip_until": (u["vip_until"] if not u["is_vip"] and (u["vip_until"] or 0) > time.time() else None)}
 
     def post_json(self, c, uid, where="", args=(), limit=100):
-        rows = c.execute(f"""SELECT p.id, p.caption, p.image, u.username, u.avatar,
+        rows = c.execute(f"""SELECT p.id, p.caption, p.image, p.kind, p.thumb, u.username, u.avatar,
             (SELECT COUNT(*) FROM likes WHERE post_id=p.id) AS likes,
             EXISTS(SELECT 1 FROM likes WHERE post_id=p.id AND user_id=?) AS liked,
             (SELECT COUNT(*) FROM comments WHERE post_id=p.id) AS comments
             FROM posts p JOIN users u ON u.id=p.user_id {where} ORDER BY p.id DESC LIMIT {int(limit)}""", (uid, *args)).fetchall()
         return [{"id": r["id"], "user": r["username"], "avatar": self.url(r["avatar"]), "image": self.url(r["image"]),
-                 "caption": r["caption"], "likes": r["likes"], "liked": bool(r["liked"]), "comments": r["comments"]} for r in rows]
+                 "caption": r["caption"], "kind": r["kind"], "thumb": self.url(r["thumb"]), "likes": r["likes"], "liked": bool(r["liked"]), "comments": r["comments"]} for r in rows]
 
     # ---- dispatch ----
     def dispatch(self, method):
@@ -381,13 +444,28 @@ class H(BaseHTTPRequestHandler):
         with db() as c:
             r = c.execute("SELECT ctype, data FROM images WHERE id=?", (int(name),)).fetchone()
         if not r: raise HTTPError(404, "Not found")
-        data = bytes(r["data"])
-        self.send_response(200)
+        data = bytes(r["data"]); total = len(data); start, end, code = 0, total - 1, 200
+        rng = self.headers.get("Range", "")
+        if rng.startswith("bytes=") and total:  # videos need byte ranges to play and seek
+            a, _, b = rng[6:].split(",")[0].partition("-")
+            try:
+                if a == "": start = max(0, total - int(b))
+                else: start, end = int(a), (int(b) if b else total - 1)
+                end = min(end, total - 1); code = 206
+            except ValueError:
+                start, end, code = 0, total - 1, 200
+            if code == 206 and start > end:
+                self.send_response(416); self.send_header("Content-Range", f"bytes */{total}")
+                self.send_header("Content-Length", "0"); self.end_headers(); return
+        body = data[start:end + 1]
+        self.send_response(code)
         self.send_header("Content-Type", r["ctype"])
-        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Accept-Ranges", "bytes")
+        if code == 206: self.send_header("Content-Range", f"bytes {start}-{end}/{total}")
         self.send_header("Cache-Control", "public, max-age=31536000, immutable")
         self.end_headers()
-        self.wfile.write(data)
+        self.wfile.write(body)
 
     def do_GET(self): self.dispatch("GET")
     def do_POST(self): self.dispatch("POST")
@@ -742,9 +820,21 @@ def list_posts(h, q):
 @route("POST", "/api/posts")
 def create_post(h, q):
     caption = (q.get("caption", [""])[0])[:2200]
+    kind = q.get("kind", ["image"])[0]
+    if kind not in ("image", "video"): raise HTTPError(400, "Unknown post type")
     with db() as c:
-        u = h.user(c); name = save_image(c, h.body())
-        pid = c.execute("INSERT INTO posts(user_id,image,caption,created) VALUES(?,?,?,?) RETURNING id", (u["id"], name, caption, time.time())).fetchone()["id"]
+        u = h.user(c); raw = h.body(); thumb = None
+        if kind == "video":
+            if len(raw) > MAX_VIDEO_BYTES: raise HTTPError(413, "Video is too large (max 20 MB)")
+            if raw[4:8] != b"ftyp": raise HTTPError(400, "Please upload an MP4 video")
+            frames, _ = video_frames(raw)
+            moderate_images([(f, "image/jpeg") for f in frames])
+            thumb = store_media(c, frames[len(frames) // 2], "image/jpeg")
+            name = store_media(c, raw, "video/mp4")
+        else:
+            name = save_image(c, raw)
+        pid = c.execute("INSERT INTO posts(user_id,image,caption,created,kind,thumb) VALUES(?,?,?,?,?,?) RETURNING id",
+                        (u["id"], name, caption, time.time(), kind, thumb)).fetchone()["id"]
         post = h.post_json(c, u["id"], "WHERE p.id=?", (pid,))[0]
     h.send_json(201, {"post": post})
 
@@ -766,7 +856,7 @@ def edit_post(h, q, pid):
 def delete_post(h, q, pid):
     with db() as c:
         u = h.user(c); p = own_post(c, u, pid)
-        c.execute("DELETE FROM posts WHERE id=?", (pid,)); remove_image(c, p["image"])
+        c.execute("DELETE FROM posts WHERE id=?", (pid,)); remove_image(c, p["image"]); remove_image(c, p["thumb"])
     h.send_json(200, {"ok": True})
 
 @route("POST", r"/api/posts/(\d+)/like")

@@ -38,8 +38,12 @@ class Story(val user: String, val avatar: String?, val images: List<String>)
 
 class Post(
     val id: Int, val user: String, val avatar: String?, val image: String,
-    initialCaption: String, initialLikes: Int, initialLiked: Boolean, initialCommentCount: Int
+    initialCaption: String, initialLikes: Int, initialLiked: Boolean, initialCommentCount: Int,
+    val kind: String = "image", val thumb: String? = null
 ) {
+    val isVideo: Boolean get() = kind == "video"
+    /** What to show as the picture: the photo itself, or a video's poster frame. */
+    val preview: String get() = if (isVideo) (thumb ?: image) else image
     // Plain MutableState fields (no property delegates) keep the Kotlin compiler happy.
     private val captionState = mutableStateOf(initialCaption)
     private val likesState = mutableIntStateOf(initialLikes)
@@ -69,12 +73,13 @@ private fun JSONObject.toProfile() =
 private fun JSONObject.toComment() = Comment(getString("user"), str("avatar"), getString("text"))
 private fun JSONObject.toPost() = Post(
     getInt("id"), getString("user"), str("avatar"), getString("image"),
-    getString("caption"), getInt("likes"), getBoolean("liked"), getInt("comments")
+    getString("caption"), getInt("likes"), getBoolean("liked"), getInt("comments"),
+    optString("kind", "image"), str("thumb")
 )
 
 class Api(var base: String, var token: String?) {
     private val client = OkHttpClient.Builder()
-        .connectTimeout(30, TimeUnit.SECONDS).readTimeout(60, TimeUnit.SECONDS).writeTimeout(60, TimeUnit.SECONDS).build()
+        .connectTimeout(30, TimeUnit.SECONDS).readTimeout(120, TimeUnit.SECONDS).writeTimeout(60, TimeUnit.SECONDS).build()
     private val JSON = "application/json".toMediaType()
     private val JPEG = "image/jpeg".toMediaType()
 
@@ -146,6 +151,8 @@ class Api(var base: String, var token: String?) {
         val a = send("GET", "/api/users/" + enc(name) + "/" + kind).getJSONArray("users")
         return List(a.length()) { a.getJSONObject(it).toProfile() }
     }
+    suspend fun createVideoPost(video: ByteArray, caption: String) =
+        send("POST", "/api/posts?kind=video&caption=" + enc(caption), video.toRequestBody("video/mp4".toMediaType())).getJSONObject("post").toPost()
     suspend fun createPost(img: ByteArray, caption: String) =
         send("POST", "/api/posts?caption=" + enc(caption), img.toRequestBody(JPEG)).getJSONObject("post").toPost()
     suspend fun editPost(id: Int, caption: String) { send("PUT", "/api/posts/$id", json("caption" to caption)) }

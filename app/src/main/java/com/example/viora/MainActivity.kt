@@ -4,6 +4,8 @@ import android.app.Application
 import android.app.Activity
 import android.content.Context
 import android.content.Intent
+import android.graphics.Bitmap
+import android.media.MediaMetadataRetriever
 import android.net.Uri
 import android.os.Bundle
 import android.widget.Toast
@@ -73,7 +75,29 @@ import androidx.compose.ui.window.DialogProperties
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import androidx.lifecycle.viewmodel.compose.viewModel
+import androidx.compose.foundation.Image
+import androidx.compose.material.icons.filled.PlayArrow
+import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.viewinterop.AndroidView
+import androidx.media3.common.MediaItem
+import androidx.media3.common.MimeTypes
+import androidx.media3.common.util.UnstableApi
+import androidx.media3.effect.Presentation
+import androidx.media3.exoplayer.ExoPlayer
+import androidx.media3.transformer.Composition
+import androidx.media3.transformer.DefaultEncoderFactory
+import androidx.media3.transformer.EditedMediaItem
+import androidx.media3.transformer.Effects
+import androidx.media3.transformer.ExportException
+import androidx.media3.transformer.ExportResult
+import androidx.media3.transformer.Transformer
+import androidx.media3.transformer.VideoEncoderSettings
+import androidx.media3.ui.PlayerView
 import coil.compose.AsyncImage
+import kotlinx.coroutines.suspendCancellableCoroutine
+import java.io.File
+import kotlin.coroutines.resume
+import kotlin.coroutines.resumeWithException
 import com.android.billingclient.api.Purchase
 import java.text.DateFormat
 import java.util.Date
@@ -191,6 +215,18 @@ class AppVm(app: Application) : AndroidViewModel(app) {
 
     fun deletePost(p: Post) = safe { api.deletePost(p.id); posts.remove(p) }
     fun editCaption(p: Post, text: String) = safe { api.editPost(p.id, text); p.caption = text }
+
+    fun shareVideo(uri: Uri, caption: String, done: () -> Unit) = safe {
+        busy = true
+        var file: File? = null
+        try {
+            file = transcodeVideo(getApplication<Application>(), uri)
+            val bytes = withContext(Dispatchers.IO) { file!!.readBytes() }
+            if (bytes.size > 20 * 1024 * 1024) throw IllegalStateException("This video is still too large after compression. Choose a shorter clip.")
+            posts.add(0, api.createVideoPost(bytes, caption))
+            done()
+        } finally { busy = false; file?.delete() }
+    }
 
     fun share(uri: Uri, caption: String, asStory: Boolean, done: () -> Unit) = safe {
         busy = true
@@ -544,6 +580,57 @@ fun StoryViewer(story: Story, onClose: () -> Unit) {
     }
 }
 
+
+/** Trims to 30 s and re-encodes to 720p H.264 at about 2 Mbit/s so uploads stay small. Must be called on the main thread. */
+@OptIn(UnstableApi::class)
+suspend fun transcodeVideo(ctx: Context, uri: Uri): File = suspendCancellableCoroutine { cont ->
+    val out = File(ctx.cacheDir, "upload_${System.currentTimeMillis()}.mp4")
+    val item = MediaItem.Builder().setUri(uri)
+        .setClippingConfiguration(MediaItem.ClippingConfiguration.Builder().setEndPositionMs(30_000).build()).build()
+    val edited = EditedMediaItem.Builder(item)
+        .setEffects(Effects(emptyList(), listOf(Presentation.createForHeight(720)))).build()
+    val transformer = Transformer.Builder(ctx)
+        .setVideoMimeType(MimeTypes.VIDEO_H264)
+        .setAudioMimeType(MimeTypes.AUDIO_AAC)
+        .setEncoderFactory(
+            DefaultEncoderFactory.Builder(ctx)
+                .setRequestedVideoEncoderSettings(VideoEncoderSettings.Builder().setBitrate(2_000_000).build()).build()
+        )
+        .addListener(object : Transformer.Listener {
+            override fun onCompleted(composition: Composition, exportResult: ExportResult) { cont.resume(out) }
+            override fun onError(composition: Composition, exportResult: ExportResult, exportException: ExportException) {
+                cont.resumeWithException(IllegalStateException("Couldn't prepare this video (${exportException.errorCodeName})"))
+            }
+        }).build()
+    transformer.start(edited, out.absolutePath)
+    cont.invokeOnCancellation { transformer.cancel() }
+}
+
+fun videoPoster(ctx: Context, uri: Uri): Bitmap? = try {
+    val r = MediaMetadataRetriever()
+    r.setDataSource(ctx, uri)
+    val frame = r.getFrameAtTime(0)
+    r.release()
+    frame
+} catch (e: Exception) { null }
+
+@Composable
+fun VideoPlayerDialog(url: String, onClose: () -> Unit) {
+    val ctx = LocalContext.current
+    val exo = remember(url) {
+        ExoPlayer.Builder(ctx).build().apply { setMediaItem(MediaItem.fromUri(url)); prepare(); playWhenReady = true }
+    }
+    DisposableEffect(exo) { onDispose { exo.release() } }
+    Dialog(onDismissRequest = onClose, properties = DialogProperties(usePlatformDefaultWidth = false)) {
+        Box(Modifier.fillMaxSize().background(Color.Black)) {
+            AndroidView(factory = { c -> PlayerView(c).apply { this.player = exo } }, modifier = Modifier.fillMaxSize())
+            IconButton(onClose, Modifier.align(Alignment.TopEnd).padding(top = 28.dp, end = 8.dp)) {
+                Icon(Icons.Filled.Close, "Close", tint = Color.White)
+            }
+        }
+    }
+}
+
 // ---------- Photo viewer (pinch to zoom) ----------
 @Composable
 fun PhotoViewer(image: Any, onClose: () -> Unit) {
@@ -575,6 +662,8 @@ class PostUi {
     var editing by mutableStateOf<Post?>(null)
     var deleting by mutableStateOf<Post?>(null)
     var photo by mutableStateOf<String?>(null)
+    var video by mutableStateOf<String?>(null)
+    fun open(p: Post) { if (p.isVideo) video = p.image else photo = p.image }
     var userView by mutableStateOf<String?>(null)
     val removed = mutableStateListOf<Int>()
 }
@@ -583,6 +672,7 @@ class PostUi {
 fun PostOverlays(vm: AppVm, ui: PostUi) {
     ui.commentsFor?.let { CommentsSheet(it, vm, { n -> ui.commentsFor = null; ui.userView = n }) { ui.commentsFor = null } }
     ui.photo?.let { PhotoViewer(it) { ui.photo = null } }
+    ui.video?.let { VideoPlayerDialog(it) { ui.video = null } }
     ui.userView?.let { UserScreen(vm, it) { ui.userView = null } }
     ui.editing?.let { p ->
         var text by remember(p) { mutableStateOf(p.caption) }
@@ -627,7 +717,7 @@ fun Feed(vm: AppVm) {
             if (list.isEmpty() && !vm.refreshing)
                 item { Text(if (vm.feedMode == 1) "Nothing to recommend yet." else "No posts yet. Share the first one from the + tab!", Modifier.padding(24.dp), color = Color.Gray) }
             items(list, key = { it.id }) { p ->
-                PostCard(p, vm, onComments = { ui.commentsFor = p }, onPhoto = { ui.photo = p.image },
+                PostCard(p, vm, onComments = { ui.commentsFor = p }, onPhoto = { ui.open(p) },
                     onEdit = { ui.editing = p }, onDelete = { ui.deleting = p }, onUser = { ui.userView = it })
             }
         }
@@ -651,7 +741,7 @@ fun PostDetail(vm: AppVm, post: Post, onDeleted: () -> Unit = {}, onClose: () ->
                 }
                 Column(Modifier.verticalScroll(rememberScrollState())) {
                     PostCard(
-                        post, vm, onComments = { ui.commentsFor = post }, onPhoto = { ui.photo = post.image },
+                        post, vm, onComments = { ui.commentsFor = post }, onPhoto = { ui.open(post) },
                         onEdit = { ui.editing = post }, onDelete = { ui.deleting = post }, onUser = { onClose() }
                     )
                 }
@@ -716,7 +806,7 @@ fun SearchScreen(vm: AppVm) {
             if (posts.isNotEmpty()) {
                 item { Text("Posts", fontWeight = FontWeight.Bold, modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp)) }
                 items(posts.filter { it.id !in ui.removed }, key = { "p" + it.id }) { p ->
-                    PostCard(p, vm, onComments = { ui.commentsFor = p }, onPhoto = { ui.photo = p.image },
+                    PostCard(p, vm, onComments = { ui.commentsFor = p }, onPhoto = { ui.open(p) },
                         onEdit = { ui.editing = p }, onDelete = { ui.deleting = p }, onUser = { ui.userView = it })
                 }
             }
@@ -748,12 +838,18 @@ fun PostCard(
                 }
             }
         }
-        AsyncImage(
-            model = p.image, contentDescription = null, contentScale = ContentScale.Crop,
-            modifier = Modifier.fillMaxWidth().aspectRatio(1f).pointerInput(Unit) {
-                detectTapGestures(onTap = { onPhoto() }, onDoubleTap = { if (!p.liked) vm.toggleLike(p) })
-            }
-        )
+        Box(Modifier.fillMaxWidth().aspectRatio(1f)) {
+            AsyncImage(
+                model = p.preview, contentDescription = null, contentScale = ContentScale.Crop,
+                modifier = Modifier.fillMaxSize().pointerInput(Unit) {
+                    detectTapGestures(onTap = { onPhoto() }, onDoubleTap = { if (!p.liked) vm.toggleLike(p) })
+                }
+            )
+            if (p.isVideo) Icon(
+                Icons.Filled.PlayArrow, "Play video", tint = Color.White,
+                modifier = Modifier.align(Alignment.Center).size(64.dp).background(Color.Black.copy(alpha = 0.4f), CircleShape)
+            )
+        }
         Row(Modifier.padding(horizontal = 6.dp)) {
             IconButton({ vm.toggleLike(p) }) {
                 Icon(
@@ -892,8 +988,10 @@ fun UserScreen(vm: AppVm, username: String, onClose: () -> Unit) {
                     if (posts.isEmpty()) Text("No posts yet.", Modifier.padding(16.dp), color = Color.Gray)
                     LazyVerticalGrid(GridCells.Fixed(3), horizontalArrangement = Arrangement.spacedBy(2.dp), verticalArrangement = Arrangement.spacedBy(2.dp)) {
                         items(posts, key = { it.id }) {
-                            AsyncImage(it.image, null, contentScale = ContentScale.Crop,
-                                modifier = Modifier.aspectRatio(1f).clickable { openPost = it })
+                            Box(Modifier.aspectRatio(1f).clickable { openPost = it }) {
+                                AsyncImage(it.preview, null, contentScale = ContentScale.Crop, modifier = Modifier.fillMaxSize())
+                                if (it.isVideo) Icon(Icons.Filled.PlayArrow, null, tint = Color.White, modifier = Modifier.align(Alignment.TopEnd).padding(4.dp).size(22.dp))
+                            }
                         }
                     }
                 }
@@ -960,23 +1058,38 @@ fun CommentsSheet(p: Post, vm: AppVm, onUser: (String) -> Unit, onClose: () -> U
 // ---------- New post / story ----------
 @Composable
 fun NewPost(vm: AppVm, onDone: () -> Unit) {
+    val ctx = LocalContext.current
     var uri by remember { mutableStateOf<Uri?>(null) }
     var caption by remember { mutableStateOf("") }
     val picker = rememberLauncherForActivityResult(ActivityResultContracts.PickVisualMedia()) { uri = it }
+    val isVideo = uri?.let { ctx.contentResolver.getType(it)?.startsWith("video") == true } == true
+    val poster by produceState<Bitmap?>(null, uri) {
+        val u = uri
+        value = if (u != null && isVideo) withContext(Dispatchers.IO) { videoPoster(ctx, u) } else null
+    }
     Column(Modifier.verticalScroll(rememberScrollState()).padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
         Text("New post", fontSize = 20.sp, fontWeight = FontWeight.Bold)
-        Button({ picker.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly)) }) {
-            Text(if (uri == null) "Choose photo" else "Change photo")
+        Button({ picker.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageAndVideo)) }) {
+            Text(if (uri == null) "Choose photo or video" else "Change")
         }
-        uri?.let { AsyncImage(it, null, contentScale = ContentScale.Crop, modifier = Modifier.fillMaxWidth().aspectRatio(1f)) }
+        if (isVideo) {
+            Box(Modifier.fillMaxWidth().aspectRatio(1f).background(Color.Black), contentAlignment = Alignment.Center) {
+                poster?.let { Image(it.asImageBitmap(), null, contentScale = ContentScale.Fit, modifier = Modifier.fillMaxSize()) }
+                Icon(Icons.Filled.PlayArrow, null, tint = Color.White, modifier = Modifier.size(56.dp))
+            }
+            Text("Videos are trimmed to 30 seconds and compressed before upload.", color = Color.Gray, fontSize = 12.sp)
+        } else uri?.let { AsyncImage(it, null, contentScale = ContentScale.Crop, modifier = Modifier.fillMaxWidth().aspectRatio(1f)) }
         OutlinedTextField(caption, { caption = it }, label = { Text("Write a caption…") }, modifier = Modifier.fillMaxWidth())
         Button(
-            onClick = { vm.share(uri!!, caption.trim(), false) { uri = null; caption = ""; onDone() } },
+            onClick = {
+                val reset = { uri = null; caption = ""; onDone() }
+                if (isVideo) vm.shareVideo(uri!!, caption.trim()) { reset() } else vm.share(uri!!, caption.trim(), false) { reset() }
+            },
             enabled = uri != null && !vm.busy, modifier = Modifier.fillMaxWidth()
-        ) { Text(if (vm.busy) "Uploading…" else "Share post") }
+        ) { Text(if (vm.busy) (if (isVideo) "Preparing video…" else "Uploading…") else "Share post") }
         OutlinedButton(
             onClick = { vm.share(uri!!, "", true) { uri = null; caption = ""; onDone() } },
-            enabled = uri != null && !vm.busy, modifier = Modifier.fillMaxWidth()
+            enabled = uri != null && !isVideo && !vm.busy, modifier = Modifier.fillMaxWidth()
         ) { Text("Add to your story (24h)") }
     }
 }
@@ -1047,8 +1160,10 @@ fun ProfileScreen(vm: AppVm) {
         if (mine.isEmpty()) Text("Share your first photo from the + tab.", Modifier.padding(16.dp), color = Color.Gray)
         LazyVerticalGrid(GridCells.Fixed(3), horizontalArrangement = Arrangement.spacedBy(2.dp), verticalArrangement = Arrangement.spacedBy(2.dp)) {
             items(mine, key = { it.id }) {
-                AsyncImage(it.image, null, contentScale = ContentScale.Crop,
-                    modifier = Modifier.aspectRatio(1f).clickable { openPost = it })
+                Box(Modifier.aspectRatio(1f).clickable { openPost = it }) {
+                    AsyncImage(it.preview, null, contentScale = ContentScale.Crop, modifier = Modifier.fillMaxSize())
+                    if (it.isVideo) Icon(Icons.Filled.PlayArrow, null, tint = Color.White, modifier = Modifier.align(Alignment.TopEnd).padding(4.dp).size(22.dp))
+                }
             }
         }
     }
