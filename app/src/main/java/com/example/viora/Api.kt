@@ -40,10 +40,24 @@ class Post(
     val id: Int, val user: String, val avatar: String?, val image: String,
     initialCaption: String, initialLikes: Int, initialLiked: Boolean, initialCommentCount: Int
 ) {
-    var caption by mutableStateOf(initialCaption)
-    var likes by mutableIntStateOf(initialLikes)
-    var liked by mutableStateOf(initialLiked)
-    var commentCount by mutableIntStateOf(initialCommentCount)
+    // Plain MutableState fields (no property delegates) keep the Kotlin compiler happy.
+    private val captionState = mutableStateOf(initialCaption)
+    private val likesState = mutableIntStateOf(initialLikes)
+    private val likedState = mutableStateOf(initialLiked)
+    private val commentCountState = mutableIntStateOf(initialCommentCount)
+
+    var caption: String
+        get() = captionState.value
+        set(v) { captionState.value = v }
+    var likes: Int
+        get() = likesState.intValue
+        set(v) { likesState.intValue = v }
+    var liked: Boolean
+        get() = likedState.value
+        set(v) { likedState.value = v }
+    var commentCount: Int
+        get() = commentCountState.intValue
+        set(v) { commentCountState.intValue = v }
 }
 
 private fun JSONObject.str(k: String): String? = if (isNull(k)) null else getString(k)
