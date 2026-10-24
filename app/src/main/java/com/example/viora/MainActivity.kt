@@ -116,6 +116,8 @@ class AppVm(app: Application) : AndroidViewModel(app) {
     val stories = mutableStateListOf<Story>()
     val forYou = mutableStateListOf<Post>()
     val followingPosts = mutableStateListOf<Post>()
+    val ads = mutableStateListOf<Post>()
+    private val seenAds = HashSet<Int>()
     var pendingPostId by mutableStateOf<Int?>(null)
     var sharedPost by mutableStateOf<Post?>(null)
     val play = PlayBilling(app, { list -> onPlayPurchases(list) }, { msg -> toast(msg) })
@@ -148,6 +150,23 @@ class AppVm(app: Application) : AndroidViewModel(app) {
     private suspend fun load() {
         val p = api.posts(); val s = api.stories()
         posts.clear(); posts.addAll(p); stories.clear(); stories.addAll(s)
+        loadAds()
+    }
+
+    /** Sponsored (boosted) posts shown between normal posts. A failure here never breaks the feed. */
+    private suspend fun loadAds() {
+        try { val a = api.ads(); ads.clear(); ads.addAll(a) }
+        catch (e: CancellationException) { throw e }
+        catch (e: Exception) { ads.clear() }
+    }
+
+    fun adSeen(id: Int) {
+        if (!seenAds.add(id)) return
+        viewModelScope.launch {
+            try { api.adSeen(id) }
+            catch (e: CancellationException) { throw e }
+            catch (e: Exception) { }
+        }
     }
 
     fun auth(register: Boolean, user: String, pw: String) = safe {
@@ -161,7 +180,7 @@ class AppVm(app: Application) : AndroidViewModel(app) {
     }
 
     fun logout() {
-        api.token = null; me = null; posts.clear(); stories.clear(); forYou.clear(); followingPosts.clear(); feedMode = 0; sharedPost = null
+        api.token = null; me = null; posts.clear(); stories.clear(); forYou.clear(); followingPosts.clear(); ads.clear(); seenAds.clear(); feedMode = 0; sharedPost = null
         prefs.edit().remove("token").apply()
     }
 
@@ -733,6 +752,8 @@ fun PostOverlays(vm: AppVm, ui: PostUi) {
     }
 }
 
+class FeedRow(val post: Post, val ad: Boolean, val key: String)
+
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun Feed(vm: AppVm) {
@@ -759,9 +780,21 @@ fun Feed(vm: AppVm) {
             }
             if (list.isEmpty() && !vm.refreshing)
                 item { Text(when (vm.feedMode) { 1 -> "Nothing to recommend yet."; 2 -> "Nothing here yet. Follow people from the search tab to see their posts."; else -> "No posts yet. Share the first one from the + tab!" }, Modifier.padding(24.dp), color = Color.Gray) }
-            items(list, key = { it.id }) { p ->
-                PostCard(p, vm, onComments = { ui.commentsFor = p }, onPhoto = { ui.open(p) },
-                    onEdit = { ui.editing = p }, onDelete = { ui.deleting = p }, onUser = { ui.userView = it })
+            val rows = ArrayList<FeedRow>()
+            val showAds = vm.ads.isNotEmpty() && vm.me?.vip != true
+            list.forEachIndexed { i, p ->
+                rows.add(FeedRow(p, false, "p${p.id}"))
+                if (showAds && (i + 1) % 5 == 0) {
+                    val slot = (i + 1) / 5 - 1
+                    val ad = vm.ads[slot % vm.ads.size]
+                    rows.add(FeedRow(ad, true, "ad$slot-${ad.id}"))
+                }
+            }
+            items(rows, key = { it.key }) { r ->
+                if (r.ad) LaunchedEffect(r.key) { vm.adSeen(r.post.id) }
+                PostCard(r.post, vm, onComments = { ui.commentsFor = r.post }, onPhoto = { ui.open(r.post) },
+                    onEdit = { ui.editing = r.post }, onDelete = { ui.deleting = r.post }, onUser = { ui.userView = it },
+                    sponsored = r.ad)
             }
         }
     }
@@ -861,20 +894,23 @@ fun SearchScreen(vm: AppVm) {
 @Composable
 fun PostCard(
     p: Post, vm: AppVm, onComments: () -> Unit, onPhoto: () -> Unit,
-    onEdit: () -> Unit, onDelete: () -> Unit, onUser: (String) -> Unit
+    onEdit: () -> Unit, onDelete: () -> Unit, onUser: (String) -> Unit, sponsored: Boolean = false
 ) {
     var menu by remember { mutableStateOf(false) }
+    var boostOpen by remember { mutableStateOf(false) }
     Column(Modifier.padding(bottom = 12.dp)) {
         Row(Modifier.padding(start = 10.dp, top = 4.dp, bottom = 4.dp), verticalAlignment = Alignment.CenterVertically) {
             Row(Modifier.weight(1f).clickable { onUser(p.user) }, verticalAlignment = Alignment.CenterVertically) {
                 Avatar(p.user, p.avatar, Modifier.size(32.dp))
                 Spacer(Modifier.width(8.dp))
                 Text(p.user, fontWeight = FontWeight.Bold)
+                if (sponsored) Text("  Sponsored", color = Color.Gray, fontSize = 12.sp)
             }
             if (p.user == vm.me?.username) {
                 Box {
                     IconButton({ menu = true }) { Icon(Icons.Filled.MoreVert, "More") }
                     DropdownMenu(menu, { menu = false }) {
+                        DropdownMenuItem(text = { Text("🚀 Boost post") }, onClick = { menu = false; boostOpen = true })
                         DropdownMenuItem(text = { Text("Edit caption") }, onClick = { menu = false; onEdit() })
                         DropdownMenuItem(text = { Text("Delete", color = Color.Red) }, onClick = { menu = false; onDelete() })
                     }
@@ -919,10 +955,59 @@ fun PostCard(
             modifier = Modifier.padding(horizontal = 12.dp, vertical = 2.dp).clickable { onComments() }
         )
         if (p.created > 0) Text(timeAgo(p.created).uppercase(), color = Color.Gray, fontSize = 11.sp, modifier = Modifier.padding(horizontal = 12.dp))
+        if (boostOpen) BoostDialog(vm, p) { boostOpen = false }
     }
 }
 
 
+
+@Composable
+fun BoostDialog(vm: AppVm, p: Post, onClose: () -> Unit) {
+    val ctx = LocalContext.current
+    val scope = rememberCoroutineScope()
+    var info by remember { mutableStateOf<BoostInfo?>(null) }
+    var busy by remember { mutableStateOf(false) }
+    LaunchedEffect(p.id) {
+        try { info = vm.api.boostInfo(p.id) }
+        catch (e: CancellationException) { throw e }
+        catch (e: Exception) { vm.toast(e.message); onClose() }
+    }
+    AlertDialog(
+        onDismissRequest = onClose,
+        title = { Text("Boost this post") },
+        text = {
+            Column {
+                val i = info
+                if (i == null) Text("Loading…", color = Color.Gray)
+                else {
+                    Text("A boosted post is shown as “Sponsored” in other people's feeds.", fontSize = 13.sp, color = Color.Gray)
+                    val until = i.until
+                    if (until != null)
+                        Text((if (i.active) "Active until " else "Ended ") + fmtDate(until) + "  ·  ${i.views} views",
+                            Modifier.padding(top = 8.dp), fontWeight = FontWeight.Medium)
+                    Spacer(Modifier.height(8.dp))
+                    if (i.plans.isEmpty()) Text("Boosting isn't available right now.", color = Color.Gray)
+                    for (plan in i.plans) {
+                        Button(
+                            onClick = {
+                                busy = true
+                                scope.launch {
+                                    try { openWeb(ctx, vm.api.boostCheckout(p.id, plan.days)); onClose() }
+                                    catch (e: CancellationException) { throw e }
+                                    catch (e: Exception) { vm.toast(e.message) }
+                                    busy = false
+                                }
+                            },
+                            enabled = !busy, modifier = Modifier.fillMaxWidth().padding(vertical = 2.dp)
+                        ) { Text("${plan.days} day${if (plan.days == 1) "" else "s"}  ·  ${plan.price}") }
+                    }
+                    if (i.active) Text("Buying again extends the boost.", fontSize = 12.sp, color = Color.Gray, modifier = Modifier.padding(top = 4.dp))
+                }
+            }
+        },
+        confirmButton = { TextButton(onClose) { Text("Close") } }
+    )
+}
 
 @Composable
 fun FollowCounts(followers: Int, following: Int, onFollowers: () -> Unit, onFollowing: () -> Unit) {

@@ -34,6 +34,8 @@ class Profile(
     val followingPrivacy: String = "everyone"
 )
 class Plan(val id: String, val name: String, val price: String)
+class BoostPlan(val days: Int, val price: String)
+class BoostInfo(val plans: List<BoostPlan>, val until: Long?, val active: Boolean, val views: Int)
 class Comment(val user: String, val avatar: String?, val text: String, val created: Long = 0)
 class Story(val user: String, val avatar: String?, val images: List<String>)
 
@@ -126,6 +128,20 @@ class Api(var base: String, var token: String?) {
         return List(a.length()) { a.getJSONObject(it).toPost() }
     }
     suspend fun post(id: Int): Post = send("GET", "/api/posts/$id").getJSONObject("post").toPost()
+    suspend fun ads(): List<Post> {
+        val a = send("GET", "/api/ads").getJSONArray("posts")
+        return List(a.length()) { a.getJSONObject(it).toPost() }
+    }
+    suspend fun adSeen(id: Int) { send("POST", "/api/ads/seen", json("post_id" to id.toString())) }
+    suspend fun boostInfo(postId: Int): BoostInfo {
+        val j = send("GET", "/api/boost/plans?post=$postId")
+        val a = j.getJSONArray("plans")
+        val plans = List(a.length()) { val o = a.getJSONObject(it); BoostPlan(o.getInt("days"), o.getString("price")) }
+        val s = j.optJSONObject("status")
+        return BoostInfo(plans, s?.optLong("until"), s?.optBoolean("active") ?: false, s?.optInt("views") ?: 0)
+    }
+    suspend fun boostCheckout(postId: Int, days: Int) =
+        send("POST", "/api/boost/checkout", json("post_id" to postId.toString(), "days" to days.toString())).getString("url")
     suspend fun following(): List<Post> {
         val a = send("GET", "/api/feed/following").getJSONArray("posts")
         return List(a.length()) { a.getJSONObject(it).toPost() }

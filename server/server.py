@@ -3,6 +3,7 @@
 Run:  python3 server.py   (env: PORT=8000, DATABASE_URL=postgres://... or VIORA_DATA=./data for SQLite)
 """
 import html as htmllib
+import random
 import base64, datetime, hashlib, hmac, io, json, math, os, re, secrets, shutil, sqlite3, subprocess, tempfile, time, traceback, urllib.error, urllib.parse, urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
@@ -35,6 +36,7 @@ SCHEMA = [
  f"CREATE TABLE IF NOT EXISTS comments(id {PK}, post_id INTEGER NOT NULL REFERENCES posts(id) ON DELETE CASCADE, user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE, text TEXT NOT NULL, created DOUBLE PRECISION)",
  f"CREATE TABLE IF NOT EXISTS codes(id {PK}, user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE, kind TEXT NOT NULL, email TEXT NOT NULL, code_hash TEXT NOT NULL, expires DOUBLE PRECISION, created DOUBLE PRECISION, attempts INTEGER NOT NULL DEFAULT 0)",
  "CREATE TABLE IF NOT EXISTS follows(follower_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE, followee_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE, created DOUBLE PRECISION, PRIMARY KEY(follower_id, followee_id))",
+ f"CREATE TABLE IF NOT EXISTS boosts(id {PK}, post_id INTEGER NOT NULL REFERENCES posts(id) ON DELETE CASCADE, user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE, days INTEGER NOT NULL, ends DOUBLE PRECISION NOT NULL, created DOUBLE PRECISION, session_id TEXT, views INTEGER NOT NULL DEFAULT 0)",
  f"CREATE TABLE IF NOT EXISTS stories(id {PK}, user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE, image TEXT NOT NULL, created DOUBLE PRECISION)",
 ]
 INTEGRITY = (sqlite3.IntegrityError, psycopg2.IntegrityError) if PG else (sqlite3.IntegrityError,)
@@ -278,6 +280,39 @@ def plan_list():
         price = os.environ.get(f"STRIPE_PRICE_{pid.upper()}")
         if price: out.append({"id": pid, "name": name, "price_id": price, "price": os.environ.get(f"PLAN_{pid.upper()}_TEXT", "")})
     return out
+
+# ---- Boosted posts ("Sponsored" in other people's feeds) ----
+def boost_currency():
+    return os.environ.get("BOOST_CURRENCY", "usd").strip().lower() or "usd"
+
+def boost_plans():
+    """Env BOOST_PLANS="days:cents,..." (default 1 day $1.99, 3 days $4.99, 7 days $8.99); BOOST_CURRENCY (default usd)."""
+    cur, out = boost_currency(), []
+    for part in os.environ.get("BOOST_PLANS", "1:199,3:499,7:899").split(","):
+        try:
+            d, cents = (int(x) for x in part.strip().split(":"))
+        except ValueError:
+            continue
+        if d < 1 or cents < 50: continue
+        out.append({"days": d, "cents": cents, "price": f"${cents / 100:.2f}" if cur == "usd" else f"{cents / 100:.2f} {cur.upper()}"})
+    return out
+
+def activate_boost(c, post_id, uid, days, session_id=None):
+    if session_id and c.execute("SELECT 1 FROM boosts WHERE session_id=?", (session_id,)).fetchone(): return  # webhook retry
+    if not c.execute("SELECT 1 FROM posts WHERE id=? AND user_id=?", (post_id, uid)).fetchone():
+        print("boost: post no longer exists", post_id, session_id, flush=True); return
+    now = time.time()
+    last = c.execute("SELECT MAX(ends) AS e FROM boosts WHERE post_id=?", (post_id,)).fetchone()["e"] or 0
+    c.execute("INSERT INTO boosts(post_id,user_id,days,ends,created,session_id) VALUES(?,?,?,?,?,?)",
+              (post_id, uid, days, max(now, float(last)) + days * 86400, now, session_id))
+
+def boost_from_session(c, obj):
+    if obj.get("payment_status") != "paid": return
+    m = obj.get("metadata") or {}
+    try:
+        activate_boost(c, int(m["boost_post_id"]), int(m["user_id"]), int(m["boost_days"]), obj.get("id"))
+    except (KeyError, ValueError):
+        print("stripe: bad boost metadata", obj.get("id"), flush=True)
 
 def verify_stripe_signature(h, raw):
     secret = os.environ.get("STRIPE_WEBHOOK_SECRET", "")
@@ -789,7 +824,9 @@ def stripe_webhook(h, q):
     except (ValueError, KeyError):
         raise HTTPError(400, "Bad event")
     with db() as c:
-        if kind == "checkout.session.completed":
+        if kind in ("checkout.session.completed", "checkout.session.async_payment_succeeded") and (obj.get("metadata") or {}).get("boost_post_id"):
+            boost_from_session(c, obj)
+        elif kind == "checkout.session.completed":
             uid, cust, subid = obj.get("client_reference_id"), obj.get("customer"), obj.get("subscription")
             if uid and str(uid).isdigit() and cust:
                 c.execute("UPDATE users SET stripe_customer=? WHERE id=?", (cust, int(uid)))
@@ -950,6 +987,76 @@ def share_page(h, q, pid):
             + f"<a class=b href=\"viora://p/{p['id']}\">Open in Viora</a>"
             "<div class=s>Install the Viora app to like, comment and follow.</div></div></body></html>")
     h.send_html(200, head + body)
+
+@route("GET", "/api/boost/plans")
+def boost_plans_route(h, q):
+    pid = q.get("post", [""])[0]
+    status = None
+    with db() as c:
+        u = h.user(c)
+        if pid.isdigit() and c.execute("SELECT 1 FROM posts WHERE id=? AND user_id=?", (int(pid), u["id"])).fetchone():
+            r = c.execute("SELECT MAX(ends) AS e, COALESCE(SUM(views),0) AS v FROM boosts WHERE post_id=?", (int(pid),)).fetchone()
+            if r["e"]: status = {"until": int(r["e"]), "active": float(r["e"]) > time.time(), "views": int(r["v"])}
+    h.send_json(200, {"plans": [{"days": p["days"], "price": p["price"]} for p in boost_plans()], "status": status})
+
+@route("POST", "/api/boost/checkout")
+def boost_checkout(h, q):
+    d = h.json_body()
+    try: pid, days = int(d.get("post_id")), int(d.get("days"))
+    except (TypeError, ValueError): raise HTTPError(400, "Bad request")
+    plan = next((p for p in boost_plans() if p["days"] == days), None)
+    if not plan: raise HTTPError(400, "That boost option isn't available")
+    with db() as c:
+        u = h.user(c)
+        if not c.execute("SELECT 1 FROM posts WHERE id=? AND user_id=?", (pid, u["id"])).fetchone(): raise HTTPError(404, "Post not found")
+        email = u["email"] if u["email_verified"] else None
+    params = {"mode": "payment", "line_items[0][quantity]": "1",
+              "line_items[0][price_data][currency]": boost_currency(),
+              "line_items[0][price_data][unit_amount]": str(plan["cents"]),
+              "line_items[0][price_data][product_data][name]": f"Viora boost: {days} day{'s' if days != 1 else ''}",
+              "client_reference_id": str(u["id"]), "metadata[boost_post_id]": str(pid), "metadata[boost_days]": str(days),
+              "metadata[user_id]": str(u["id"]),
+              "success_url": h.origin() + "/billing/return", "cancel_url": h.origin() + "/billing/return"}
+    if email: params["customer_email"] = email
+    h.send_json(200, {"url": stripe_api("POST", "/v1/checkout/sessions", params)["url"]})
+
+@route("POST", "/api/admin/boost")
+def admin_boost(h, q):
+    key = os.environ.get("ADMIN_KEY", "")
+    if not key or not hmac.compare_digest(h.headers.get("X-Admin-Key", "").encode(), key.encode()):
+        raise HTTPError(403, "Forbidden")
+    d = h.json_body()
+    try: pid, days = int(d.get("post_id")), int(d.get("days", 1))
+    except (TypeError, ValueError): raise HTTPError(400, "Bad request")
+    if not 1 <= days <= 365: raise HTTPError(400, "days must be 1-365")
+    with db() as c:
+        p = c.execute("SELECT user_id FROM posts WHERE id=?", (pid,)).fetchone()
+        if not p: raise HTTPError(404, "Post not found")
+        activate_boost(c, pid, p["user_id"], days)
+    h.send_json(200, {"ok": True, "post_id": pid, "days": days})
+
+@route("GET", "/api/ads")
+def ads(h, q):
+    """Active boosted posts from other people, shuffled. VIP members see no ads."""
+    with db() as c:
+        u = h.user(c)
+        if vip_active(u): return h.send_json(200, {"posts": []})
+        rows = c.execute("SELECT DISTINCT post_id FROM boosts WHERE ends>? AND user_id<>?", (time.time(), u["id"])).fetchall()
+        ids = [r["post_id"] for r in rows]
+        random.shuffle(ids)
+        posts = []
+        for i in ids[:5]: posts += h.post_json(c, u["id"], "WHERE p.id=?", (i,))
+    h.send_json(200, {"posts": posts})
+
+@route("POST", "/api/ads/seen")
+def ad_seen(h, q):
+    try: pid = int(h.json_body().get("post_id"))
+    except (TypeError, ValueError): raise HTTPError(400, "Bad request")
+    with db() as c:
+        u = h.user(c)
+        c.execute("UPDATE boosts SET views=views+1 WHERE id=(SELECT id FROM boosts WHERE post_id=? AND ends>? AND user_id<>? ORDER BY ends DESC LIMIT 1)",
+                  (pid, time.time(), u["id"]))
+    h.send_json(200, {"ok": True})
 
 @route("PUT", r"/api/posts/(\d+)")
 def edit_post(h, q, pid):
