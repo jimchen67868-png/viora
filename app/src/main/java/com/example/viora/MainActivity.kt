@@ -118,6 +118,23 @@ class AppVm(app: Application) : AndroidViewModel(app) {
     val followingPosts = mutableStateListOf<Post>()
     val ads = mutableStateListOf<Post>()
     private val seenAds = HashSet<Int>()
+    private val viewedPosts = HashSet<Int>()
+    private val viewQueue = ArrayList<Int>()
+    private var viewJob: kotlinx.coroutines.Job? = null
+
+    /** Counts a view when a post appears on screen: batched, once per post per session, never for your own posts. */
+    fun postSeen(p: Post) {
+        if (p.user == me?.username || !viewedPosts.add(p.id)) return
+        viewQueue.add(p.id)
+        if (viewJob?.isActive == true) return
+        viewJob = viewModelScope.launch {
+            delay(2000)
+            val ids = viewQueue.toList(); viewQueue.clear()
+            try { api.postsSeen(ids) }
+            catch (e: CancellationException) { throw e }
+            catch (e: Exception) { }
+        }
+    }
     var pendingPostId by mutableStateOf<Int?>(null)
     var sharedPost by mutableStateOf<Post?>(null)
     val play = PlayBilling(app, { list -> onPlayPurchases(list) }, { msg -> toast(msg) })
@@ -180,7 +197,7 @@ class AppVm(app: Application) : AndroidViewModel(app) {
     }
 
     fun logout() {
-        api.token = null; me = null; posts.clear(); stories.clear(); forYou.clear(); followingPosts.clear(); ads.clear(); seenAds.clear(); feedMode = 0; sharedPost = null
+        api.token = null; me = null; posts.clear(); stories.clear(); forYou.clear(); followingPosts.clear(); ads.clear(); seenAds.clear(); viewedPosts.clear(); viewQueue.clear(); feedMode = 0; sharedPost = null
         prefs.edit().remove("token").apply()
     }
 
@@ -898,6 +915,7 @@ fun PostCard(
 ) {
     var menu by remember { mutableStateOf(false) }
     var boostOpen by remember { mutableStateOf(false) }
+    LaunchedEffect(p.id) { vm.postSeen(p) }
     Column(Modifier.padding(bottom = 12.dp)) {
         Row(Modifier.padding(start = 10.dp, top = 4.dp, bottom = 4.dp), verticalAlignment = Alignment.CenterVertically) {
             Row(Modifier.weight(1f).clickable { onUser(p.user) }, verticalAlignment = Alignment.CenterVertically) {
@@ -954,7 +972,11 @@ fun PostCard(
             color = Color.Gray,
             modifier = Modifier.padding(horizontal = 12.dp, vertical = 2.dp).clickable { onComments() }
         )
-        if (p.created > 0) Text(timeAgo(p.created).uppercase(), color = Color.Gray, fontSize = 11.sp, modifier = Modifier.padding(horizontal = 12.dp))
+        val meta = listOfNotNull(
+            "${p.views} view${if (p.views == 1) "" else "s"}",
+            if (p.created > 0) timeAgo(p.created).uppercase() else null
+        ).joinToString("  ·  ")
+        Text(meta, color = Color.Gray, fontSize = 11.sp, modifier = Modifier.padding(horizontal = 12.dp))
         if (boostOpen) BoostDialog(vm, p) { boostOpen = false }
     }
 }

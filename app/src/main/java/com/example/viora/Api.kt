@@ -17,6 +17,7 @@ import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody
 import okhttp3.RequestBody.Companion.toRequestBody
+import org.json.JSONArray
 import org.json.JSONObject
 import java.io.ByteArrayOutputStream
 import java.net.URLEncoder
@@ -42,7 +43,7 @@ class Story(val user: String, val avatar: String?, val images: List<String>)
 class Post(
     val id: Int, val user: String, val avatar: String?, val image: String,
     initialCaption: String, initialLikes: Int, initialLiked: Boolean, initialCommentCount: Int,
-    val kind: String = "image", val thumb: String? = null, val created: Long = 0
+    val kind: String = "image", val thumb: String? = null, val created: Long = 0, val views: Int = 0
 ) {
     val isVideo: Boolean get() = kind == "video"
     /** What to show as the picture: the photo itself, or a video's poster frame. */
@@ -78,7 +79,7 @@ private fun JSONObject.toComment() = Comment(getString("user"), str("avatar"), g
 private fun JSONObject.toPost() = Post(
     getInt("id"), getString("user"), str("avatar"), getString("image"),
     getString("caption"), getInt("likes"), getBoolean("liked"), getInt("comments"),
-    optString("kind", "image"), str("thumb"), optLong("created", 0L)
+    optString("kind", "image"), str("thumb"), optLong("created", 0L), optInt("views", 0)
 )
 
 class Api(var base: String, var token: String?) {
@@ -131,6 +132,9 @@ class Api(var base: String, var token: String?) {
     suspend fun ads(): List<Post> {
         val a = send("GET", "/api/ads").getJSONArray("posts")
         return List(a.length()) { a.getJSONObject(it).toPost() }
+    }
+    suspend fun postsSeen(ids: List<Int>) {
+        send("POST", "/api/posts/seen", JSONObject().put("ids", JSONArray(ids)).toString().toRequestBody(JSON))
     }
     suspend fun adSeen(id: Int) { send("POST", "/api/ads/seen", json("post_id" to id.toString())) }
     suspend fun boostInfo(postId: Int): BoostInfo {

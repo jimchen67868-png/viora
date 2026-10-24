@@ -36,6 +36,7 @@ SCHEMA = [
  f"CREATE TABLE IF NOT EXISTS comments(id {PK}, post_id INTEGER NOT NULL REFERENCES posts(id) ON DELETE CASCADE, user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE, text TEXT NOT NULL, created DOUBLE PRECISION)",
  f"CREATE TABLE IF NOT EXISTS codes(id {PK}, user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE, kind TEXT NOT NULL, email TEXT NOT NULL, code_hash TEXT NOT NULL, expires DOUBLE PRECISION, created DOUBLE PRECISION, attempts INTEGER NOT NULL DEFAULT 0)",
  "CREATE TABLE IF NOT EXISTS follows(follower_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE, followee_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE, created DOUBLE PRECISION, PRIMARY KEY(follower_id, followee_id))",
+ "CREATE TABLE IF NOT EXISTS post_views(post_id INTEGER NOT NULL REFERENCES posts(id) ON DELETE CASCADE, user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE, created DOUBLE PRECISION, PRIMARY KEY(post_id, user_id))",
  f"CREATE TABLE IF NOT EXISTS boosts(id {PK}, post_id INTEGER NOT NULL REFERENCES posts(id) ON DELETE CASCADE, user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE, days INTEGER NOT NULL, ends DOUBLE PRECISION NOT NULL, created DOUBLE PRECISION, session_id TEXT, views INTEGER NOT NULL DEFAULT 0)",
  f"CREATE TABLE IF NOT EXISTS stories(id {PK}, user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE, image TEXT NOT NULL, created DOUBLE PRECISION)",
 ]
@@ -486,10 +487,11 @@ class H(BaseHTTPRequestHandler):
         rows = c.execute(f"""SELECT p.id, p.caption, p.image, p.kind, p.thumb, p.created, u.username, u.avatar,
             (SELECT COUNT(*) FROM likes WHERE post_id=p.id) AS likes,
             EXISTS(SELECT 1 FROM likes WHERE post_id=p.id AND user_id=?) AS liked,
-            (SELECT COUNT(*) FROM comments WHERE post_id=p.id) AS comments
+            (SELECT COUNT(*) FROM comments WHERE post_id=p.id) AS comments,
+            (SELECT COUNT(*) FROM post_views WHERE post_id=p.id) AS views
             FROM posts p JOIN users u ON u.id=p.user_id {where} ORDER BY p.id DESC LIMIT {int(limit)}""", (uid, *args)).fetchall()
         return [{"id": r["id"], "user": r["username"], "avatar": self.url(r["avatar"]), "image": self.url(r["image"]),
-                 "caption": r["caption"], "kind": r["kind"], "thumb": self.url(r["thumb"]), "likes": r["likes"], "liked": bool(r["liked"]), "comments": r["comments"], "created": int(r["created"] or 0)} for r in rows]
+                 "caption": r["caption"], "kind": r["kind"], "thumb": self.url(r["thumb"]), "likes": r["likes"], "liked": bool(r["liked"]), "comments": r["comments"], "created": int(r["created"] or 0), "views": r["views"]} for r in rows]
 
     # ---- dispatch ----
     def dispatch(self, method):
@@ -1047,6 +1049,19 @@ def ads(h, q):
         posts = []
         for i in ids[:5]: posts += h.post_json(c, u["id"], "WHERE p.id=?", (i,))
     h.send_json(200, {"posts": posts})
+
+@route("POST", "/api/posts/seen")
+def posts_seen(h, q):
+    """Counts each person once per post; the owner's own views don't count."""
+    raw = h.json_body().get("ids")
+    if not isinstance(raw, list): raise HTTPError(400, "Bad request")
+    ids = {int(x) for x in raw[:50] if isinstance(x, int) or (isinstance(x, str) and x.isdigit())}
+    with db() as c:
+        u = h.user(c)
+        for pid in ids:
+            c.execute("INSERT INTO post_views(post_id,user_id,created) SELECT id,?,? FROM posts WHERE id=? AND user_id<>? ON CONFLICT DO NOTHING",
+                      (u["id"], time.time(), pid, u["id"]))
+    h.send_json(200, {"ok": True})
 
 @route("POST", "/api/ads/seen")
 def ad_seen(h, q):
