@@ -111,9 +111,39 @@ def moderate_image(data, ctype):
     moderate_images([(data, ctype)])
 
 # ---- video: frame sampling (PyAV if installed, else the ffmpeg command-line tools) ----
+def _mp4_boxes(buf, start, end):
+    i = start
+    while i + 8 <= end:
+        size = int.from_bytes(buf[i:i + 4], "big"); typ = buf[i + 4:i + 8]; hdr = 8
+        if size == 1: size = int.from_bytes(buf[i + 8:i + 16], "big"); hdr = 16
+        elif size == 0: size = end - i
+        if size < hdr: break
+        yield typ, i + hdr, min(i + size, end)
+        i += size
+
+def mp4_rotation(data):
+    """Clockwise rotation (0/90/180/270) that players apply to the video track, read from the MP4 'tkhd' matrix.
+    Phones record portrait video as landscape pixels plus this rotation; PyAV doesn't apply it, so we do."""
+    try:
+        for t, s, e in _mp4_boxes(data, 0, len(data)):
+            if t != b"moov": continue
+            for t2, s2, e2 in _mp4_boxes(data, s, e):
+                if t2 != b"trak": continue
+                for t3, s3, e3 in _mp4_boxes(data, s2, e2):
+                    if t3 != b"tkhd": continue
+                    off = s3 + 4 + (20 if data[s3] == 0 else 32) + 16
+                    a, b, c, d = (int.from_bytes(data[off + k:off + k + 4], "big", signed=True) for k in (0, 4, 12, 16))
+                    if int.from_bytes(data[off + 36:off + 40], "big") == 0: continue  # audio track
+                    one = 0x10000
+                    return {(0, one, -one, 0): 90, (-one, 0, 0, -one): 180, (0, -one, one, 0): 270}.get((a, b, c, d), 0)
+    except Exception:
+        pass
+    return 0
+
 def _frames_pyav(data, n):
     import av
     out = []
+    rotation = mp4_rotation(data)
     with av.open(io.BytesIO(data)) as container:
         if not container.streams.video: raise ValueError("no video stream")
         duration = container.duration / av.time_base if container.duration else None
@@ -121,7 +151,9 @@ def _frames_pyav(data, n):
         for i in range(n):
             container.seek(int(duration * (i + 0.5) / n * av.time_base))
             for frame in container.decode(video=0):
-                img = frame.to_image(); img.thumbnail((640, 640))
+                img = frame.to_image()
+                if rotation: img = img.rotate(-rotation, expand=True)  # PIL angles are counter-clockwise
+                img.thumbnail((640, 640))
                 buf = io.BytesIO(); img.convert("RGB").save(buf, "JPEG", quality=80); out.append(buf.getvalue())
                 break
     return out, duration
