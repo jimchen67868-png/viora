@@ -849,6 +849,14 @@ def follow_list(h, q, name, kind):
 def list_posts(h, q):
     with db() as c: h.send_json(200, {"posts": h.post_json(c, h.user(c)["id"])})
 
+@route("GET", "/api/feed/following")
+def following_feed(h, q):
+    """Posts from people the user follows, plus their own, newest first."""
+    with db() as c:
+        uid = h.user(c)["id"]
+        posts = h.post_json(c, uid, "WHERE (p.user_id=? OR p.user_id IN (SELECT followee_id FROM follows WHERE follower_id=?))", (uid, uid))
+    h.send_json(200, {"posts": posts})
+
 @route("POST", "/api/posts")
 def create_post(h, q):
     caption = (q.get("caption", [""])[0])[:2200]

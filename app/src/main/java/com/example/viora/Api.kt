@@ -121,6 +121,10 @@ class Api(var base: String, var token: String?) {
         val a = send("GET", "/api/posts").getJSONArray("posts")
         return List(a.length()) { a.getJSONObject(it).toPost() }
     }
+    suspend fun following(): List<Post> {
+        val a = send("GET", "/api/feed/following").getJSONArray("posts")
+        return List(a.length()) { a.getJSONObject(it).toPost() }
+    }
     suspend fun user(name: String): Pair<Profile, List<Post>> {
         val j = send("GET", "/api/users/" + enc(name))
         val a = j.getJSONArray("posts")

@@ -115,6 +115,7 @@ class AppVm(app: Application) : AndroidViewModel(app) {
     val posts = mutableStateListOf<Post>()
     val stories = mutableStateListOf<Story>()
     val forYou = mutableStateListOf<Post>()
+    val followingPosts = mutableStateListOf<Post>()
     val play = PlayBilling(app, { list -> onPlayPurchases(list) }, { msg -> toast(msg) })
     var forYouPersonal by mutableStateOf(true)
     var feedMode by mutableIntStateOf(0)
@@ -158,7 +159,7 @@ class AppVm(app: Application) : AndroidViewModel(app) {
     }
 
     fun logout() {
-        api.token = null; me = null; posts.clear(); stories.clear(); forYou.clear(); feedMode = 0
+        api.token = null; me = null; posts.clear(); stories.clear(); forYou.clear(); followingPosts.clear(); feedMode = 0
         prefs.edit().remove("token").apply()
     }
 
@@ -167,7 +168,8 @@ class AppVm(app: Application) : AndroidViewModel(app) {
         try {
             saveMe(api.me()); load()
             syncPlay()
-            if (me?.vip != true) feedMode = 0 else if (feedMode == 1) loadForYou()
+            if (me?.vip != true && feedMode == 1) feedMode = 0
+            if (feedMode == 1) loadForYou() else if (feedMode == 2) loadFollowing()
         } finally { refreshing = false }
     }
 
@@ -199,6 +201,8 @@ class AppVm(app: Application) : AndroidViewModel(app) {
         } catch (e: ApiException) { if (e.code == 403) feedMode = 0; throw e }
     }
     fun openForYou() { feedMode = 1; safe { loadForYou() } }
+    private suspend fun loadFollowing() { val l = api.following(); followingPosts.clear(); followingPosts.addAll(l) }
+    fun openFollowing() { feedMode = 2; safe { loadFollowing() } }
 
     fun toggleLike(p: Post) {
         val wasLiked = p.liked; val wasCount = p.likes
@@ -704,18 +708,23 @@ fun Feed(vm: AppVm) {
     PullToRefreshBox(isRefreshing = vm.refreshing, onRefresh = { vm.refresh() }) {
         LazyColumn(Modifier.fillMaxSize()) {
             item { Stories(vm) { story = it } }
-            if (vm.me?.vip == true) item {
+            item {
                 Row(Modifier.padding(horizontal = 12.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     FilterChip(vm.feedMode == 0, { vm.feedMode = 0 }, label = { Text("Latest") })
-                    FilterChip(vm.feedMode == 1, { vm.openForYou() }, label = { Text("⭐ For you") })
+                    FilterChip(vm.feedMode == 2, { vm.openFollowing() }, label = { Text("Following") })
+                    if (vm.me?.vip == true) FilterChip(vm.feedMode == 1, { vm.openForYou() }, label = { Text("⭐ For you") })
                 }
                 if (vm.feedMode == 1 && !vm.forYouPersonal)
                     Text("Like a few posts and this feed will learn your taste. Showing popular posts for now.",
                         Modifier.padding(horizontal = 16.dp, vertical = 8.dp), color = Color.Gray, fontSize = 13.sp)
             }
-            val list = if (vm.feedMode == 1 && vm.me?.vip == true) vm.forYou else vm.posts
+            val list = when {
+                vm.feedMode == 1 && vm.me?.vip == true -> vm.forYou
+                vm.feedMode == 2 -> vm.followingPosts
+                else -> vm.posts
+            }
             if (list.isEmpty() && !vm.refreshing)
-                item { Text(if (vm.feedMode == 1) "Nothing to recommend yet." else "No posts yet. Share the first one from the + tab!", Modifier.padding(24.dp), color = Color.Gray) }
+                item { Text(when (vm.feedMode) { 1 -> "Nothing to recommend yet."; 2 -> "Nothing here yet. Follow people from the search tab to see their posts."; else -> "No posts yet. Share the first one from the + tab!" }, Modifier.padding(24.dp), color = Color.Gray) }
             items(list, key = { it.id }) { p ->
                 PostCard(p, vm, onComments = { ui.commentsFor = p }, onPhoto = { ui.open(p) },
                     onEdit = { ui.editing = p }, onDelete = { ui.deleting = p }, onUser = { ui.userView = it })
