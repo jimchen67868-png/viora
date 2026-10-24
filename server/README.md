@@ -25,3 +25,11 @@ Env: `STRIPE_SECRET_KEY` (sk_...), `STRIPE_WEBHOOK_SECRET` (whsec_...), `STRIPE_
 Webhook endpoint: `https://YOUR-SERVER/api/stripe/webhook` with events
 `checkout.session.completed`, `customer.subscription.created`, `customer.subscription.updated`, `customer.subscription.deleted`.
 Enable the Customer Portal in the Stripe dashboard so subscribers can cancel/update their card ("Manage" button).
+
+## Google Play subscriptions
+Env: `GOOGLE_SERVICE_ACCOUNT_JSON` (full JSON key of a Google Cloud service account that has been granted access in Play Console
+with "View financial data" + "Manage orders and subscriptions"), `GOOGLE_PLAY_PACKAGE` (the app's applicationId),
+`GOOGLE_PLAY_PRODUCT_ID` (subscription product id, default `viora_vip`; base plans `monthly` / `yearly`).
+The app sends the purchase token to `/api/billing/google/verify`; the server verifies it with the Play Developer API
+(`purchases.subscriptionsv2.get`), grants VIP until the expiry time and acknowledges the purchase.
+`/api/billing/google/sync` re-checks later so cancellations/refunds take effect.

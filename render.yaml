@@ -29,3 +29,9 @@ services:
         value: "$4.99 / month"
       - key: PLAN_YEARLY_TEXT
         value: "$39.99 / year"
+      - key: GOOGLE_SERVICE_ACCOUNT_JSON
+        sync: false
+      - key: GOOGLE_PLAY_PACKAGE
+        value: io.github.jimchen67868.viora
+      - key: GOOGLE_PLAY_PRODUCT_ID
+        value: viora_vip

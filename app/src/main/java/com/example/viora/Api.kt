@@ -29,7 +29,8 @@ class ApiException(val code: Int, message: String) : Exception(message)
 
 class Profile(
     val username: String, val bio: String, val avatar: String?,
-    val email: String? = null, val emailVerified: Boolean = false, val vip: Boolean = false, val vipUntil: Long? = null
+    val email: String? = null, val emailVerified: Boolean = false, val vip: Boolean = false, val vipUntil: Long? = null, val accountId: String? = null,
+    val followers: Int = 0, val following: Int = 0, val isFollowing: Boolean = false
 )
 class Plan(val id: String, val name: String, val price: String)
 class Comment(val user: String, val avatar: String?, val text: String)
@@ -48,7 +49,9 @@ class Post(
 private fun JSONObject.str(k: String): String? = if (isNull(k)) null else getString(k)
 private fun JSONObject.toProfile() =
     Profile(getString("username"), optString("bio", ""), str("avatar"), str("email"), optBoolean("email_verified", false), optBoolean("vip", false),
-        if (has("vip_until") && !isNull("vip_until")) getLong("vip_until") else null)
+        if (has("vip_until") && !isNull("vip_until")) getLong("vip_until") else null,
+        str("account_id"),
+        followers = optInt("followers", 0), following = optInt("following", 0), isFollowing = optBoolean("is_following", false))
 private fun JSONObject.toComment() = Comment(getString("user"), str("avatar"), getString("text"))
 private fun JSONObject.toPost() = Post(
     getInt("id"), getString("user"), str("avatar"), getString("image"),
@@ -120,6 +123,15 @@ class Api(var base: String, var token: String?) {
     }
     suspend fun checkout(plan: String) = send("POST", "/api/billing/checkout", json("plan" to plan)).getString("url")
     suspend fun portal() = send("POST", "/api/billing/portal").getString("url")
+    suspend fun verifyGoogle(token: String) =
+        send("POST", "/api/billing/google/verify", json("purchase_token" to token)).getJSONObject("user").toProfile()
+    suspend fun syncGoogle() = send("POST", "/api/billing/google/sync").getJSONObject("user").toProfile()
+    suspend fun follow(name: String, on: Boolean): Int =
+        send(if (on) "POST" else "DELETE", "/api/users/" + enc(name) + "/follow").getInt("followers")
+    suspend fun followList(name: String, kind: String): List<Profile> {
+        val a = send("GET", "/api/users/" + enc(name) + "/" + kind).getJSONArray("users")
+        return List(a.length()) { a.getJSONObject(it).toProfile() }
+    }
     suspend fun createPost(img: ByteArray, caption: String) =
         send("POST", "/api/posts?caption=" + enc(caption), img.toRequestBody(JPEG)).getJSONObject("post").toPost()
     suspend fun editPost(id: Int, caption: String) { send("PUT", "/api/posts/$id", json("caption" to caption)) }

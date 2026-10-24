@@ -1,12 +1,14 @@
 package com.example.viora
 
 import android.app.Application
+import android.app.Activity
 import android.content.Context
 import android.content.Intent
 import android.net.Uri
 import android.os.Bundle
 import android.widget.Toast
 import androidx.activity.ComponentActivity
+import androidx.activity.enableEdgeToEdge
 import androidx.activity.viewModels
 import androidx.browser.customtabs.CustomTabsIntent
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -43,6 +45,7 @@ import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material.icons.filled.Person
 import androidx.compose.material.icons.filled.Search
 import androidx.compose.material.icons.filled.Send
+import androidx.compose.material.icons.filled.Share
 import androidx.compose.material.icons.outlined.ChatBubbleOutline
 import androidx.compose.material3.*
 import androidx.compose.material3.pulltorefresh.PullToRefreshBox
@@ -71,6 +74,7 @@ import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import androidx.lifecycle.viewmodel.compose.viewModel
 import coil.compose.AsyncImage
+import com.android.billingclient.api.Purchase
 import java.text.DateFormat
 import java.util.Date
 import kotlinx.coroutines.CancellationException
@@ -87,6 +91,7 @@ class AppVm(app: Application) : AndroidViewModel(app) {
     val posts = mutableStateListOf<Post>()
     val stories = mutableStateListOf<Story>()
     val forYou = mutableStateListOf<Post>()
+    val play = PlayBilling(app, { list -> onPlayPurchases(list) }, { msg -> toast(msg) })
     var forYouPersonal by mutableStateOf(true)
     var feedMode by mutableIntStateOf(0)
     var refreshing by mutableStateOf(false)
@@ -137,8 +142,30 @@ class AppVm(app: Application) : AndroidViewModel(app) {
         refreshing = true
         try {
             saveMe(api.me()); load()
+            syncPlay()
             if (me?.vip != true) feedMode = 0 else if (feedMode == 1) loadForYou()
         } finally { refreshing = false }
+    }
+
+    private fun onPlayPurchases(list: List<Purchase>) = safe {
+        busy = true
+        try {
+            for (p in list) {
+                if (p.purchaseState == Purchase.PurchaseState.PURCHASED) { saveMe(api.verifyGoogle(p.purchaseToken)); toast("VIP activated ⭐") }
+                else if (p.purchaseState == Purchase.PurchaseState.PENDING) toast("Payment pending. VIP starts when it completes.")
+            }
+            load()
+        } finally { busy = false }
+    }
+
+    /** Re-verifies Play subscriptions with the server (new purchases, renewals, cancellations, refunds). */
+    private suspend fun syncPlay() {
+        if (!USE_PLAY_BILLING) return
+        try {
+            for (p in play.owned()) if (p.purchaseState == Purchase.PurchaseState.PURCHASED) saveMe(api.verifyGoogle(p.purchaseToken))
+            saveMe(api.syncGoogle())
+        } catch (e: CancellationException) { throw e }
+        catch (e: Exception) { /* Play not available on this device: ignore */ }
     }
 
     private suspend fun loadForYou() {
@@ -195,6 +222,11 @@ class AppVm(app: Application) : AndroidViewModel(app) {
         try { api.resetPassword(email, code, pw); toast("Password changed. Please log in."); ok() } finally { busy = false }
     }
 
+    fun follow(name: String, on: Boolean, done: (Int) -> Unit) = safe {
+        busy = true
+        try { val n = api.follow(name, on); saveMe(api.me()); done(n) } finally { busy = false }
+    }
+
     fun startCheckout(plan: String, open: (String) -> Unit) = safe {
         busy = true
         try { open(api.checkout(plan)) } finally { busy = false }
@@ -221,6 +253,7 @@ class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        enableEdgeToEdge()
         setContent { MaterialTheme { Surface { App() } } }
     }
 
@@ -262,7 +295,7 @@ fun Login(vm: AppVm) {
     var resetOpen by remember { mutableStateOf(false) }
     if (resetOpen) ResetDialog(vm) { resetOpen = false }
     Column(
-        Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(24.dp),
+        Modifier.fillMaxSize().safeDrawingPadding().verticalScroll(rememberScrollState()).padding(24.dp),
         verticalArrangement = Arrangement.Center, horizontalAlignment = Alignment.CenterHorizontally
     ) {
         Text("Viora", fontSize = 42.sp, fontWeight = FontWeight.Bold)
@@ -366,16 +399,49 @@ fun openWeb(ctx: Context, url: String) {
     catch (e: Exception) { ctx.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(url))) }
 }
 
+fun Context.findActivity(): Activity? {
+    var c: Context? = this
+    while (c is android.content.ContextWrapper) { if (c is Activity) return c; c = c.baseContext }
+    return null
+}
+
+class PlanRow(val label: String, val onClick: () -> Unit)
+
+fun sharePost(ctx: Context, p: Post) {
+    val text = buildString {
+        append(p.user).append(" on Viora")
+        if (p.caption.isNotBlank()) append(": ").append(p.caption)
+        append("\n").append(p.image)
+    }
+    val send = Intent(Intent.ACTION_SEND).apply { type = "text/plain"; putExtra(Intent.EXTRA_TEXT, text) }
+    ctx.startActivity(Intent.createChooser(send, "Share post"))
+}
+
 fun fmtDate(epochSeconds: Long): String = DateFormat.getDateInstance(DateFormat.MEDIUM).format(Date(epochSeconds * 1000))
 
 @Composable
 fun VipDialog(vm: AppVm, onClose: () -> Unit) {
     val ctx = LocalContext.current
-    var plans by remember { mutableStateOf<List<Plan>?>(null) }
+    var rows by remember { mutableStateOf<List<PlanRow>?>(null) }
     LaunchedEffect(Unit) {
-        try { plans = vm.api.plans() }
+        try {
+            rows = if (USE_PLAY_BILLING) {
+                vm.play.plans().map { pl ->
+                    PlanRow("${pl.name} · ${pl.price}") {
+                        val act = ctx.findActivity()
+                        if (act != null) { vm.play.buy(act, pl, vm.me?.accountId ?: ""); onClose() }
+                    }
+                }
+            } else {
+                vm.api.plans().map { plan ->
+                    PlanRow(if (plan.price.isBlank()) plan.name else "${plan.name} · ${plan.price}") {
+                        vm.startCheckout(plan.id) { url -> openWeb(ctx, url); onClose() }
+                    }
+                }
+            }
+        }
         catch (e: CancellationException) { throw e }
-        catch (e: Exception) { vm.toast(e.message); plans = emptyList() }
+        catch (e: Exception) { vm.toast(e.message); rows = emptyList() }
     }
     AlertDialog(
         onDismissRequest = onClose,
@@ -383,16 +449,17 @@ fun VipDialog(vm: AppVm, onClose: () -> Unit) {
         text = {
             Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                 Text("Get a personalised “For you” feed based on the posts you like.", color = Color.Gray, fontSize = 13.sp)
-                val list = plans
+                val list = rows
                 if (list == null) Text("Loading plans…")
                 else if (list.isEmpty()) Text("Subscriptions aren't available yet.", color = Color.Gray)
-                else list.forEach { plan ->
-                    Button(
-                        onClick = { vm.startCheckout(plan.id) { url -> openWeb(ctx, url); onClose() } },
-                        enabled = !vm.busy, modifier = Modifier.fillMaxWidth()
-                    ) { Text(if (plan.price.isBlank()) plan.name else "${plan.name} · ${plan.price}") }
+                else list.forEach { row ->
+                    Button(onClick = row.onClick, enabled = !vm.busy, modifier = Modifier.fillMaxWidth()) { Text(row.label) }
                 }
-                Text("Secure payment by Stripe. Cancel any time with Manage.", color = Color.Gray, fontSize = 12.sp)
+                Text(
+                    if (USE_PLAY_BILLING) "Billed by Google Play. Cancel any time in Play Store subscriptions."
+                    else "Secure payment by Stripe. Cancel any time with Manage.",
+                    color = Color.Gray, fontSize = 12.sp
+                )
             }
         },
         confirmButton = {},
@@ -569,6 +636,31 @@ fun Feed(vm: AppVm) {
     PostOverlays(vm, ui)
 }
 
+
+// ---------- A single post, full view ----------
+@Composable
+fun PostDetail(vm: AppVm, post: Post, onDeleted: () -> Unit = {}, onClose: () -> Unit) {
+    val ui = remember { PostUi() }
+    LaunchedEffect(ui.removed.size) { if (post.id in ui.removed) { onDeleted(); onClose() } }
+    Dialog(onDismissRequest = onClose, properties = DialogProperties(usePlatformDefaultWidth = false)) {
+        Surface(Modifier.fillMaxSize()) {
+            Column(Modifier.padding(top = 24.dp)) {
+                Row(Modifier.padding(horizontal = 8.dp), verticalAlignment = Alignment.CenterVertically) {
+                    IconButton(onClose) { Icon(Icons.Filled.Close, "Close") }
+                    Text("Post", fontWeight = FontWeight.Bold, fontSize = 18.sp)
+                }
+                Column(Modifier.verticalScroll(rememberScrollState())) {
+                    PostCard(
+                        post, vm, onComments = { ui.commentsFor = post }, onPhoto = { ui.photo = post.image },
+                        onEdit = { ui.editing = post }, onDelete = { ui.deleting = post }, onUser = { onClose() }
+                    )
+                }
+            }
+            PostOverlays(vm, ui)
+        }
+    }
+}
+
 // ---------- Search ----------
 @Composable
 fun SearchScreen(vm: AppVm) {
@@ -670,6 +762,8 @@ fun PostCard(
                 )
             }
             IconButton(onComments) { Icon(Icons.Outlined.ChatBubbleOutline, "Comments") }
+            val ctx = LocalContext.current
+            IconButton({ sharePost(ctx, p) }) { Icon(Icons.Filled.Share, "Share") }
         }
         Text("${p.likes} likes", fontWeight = FontWeight.Bold, modifier = Modifier.padding(horizontal = 12.dp))
         if (p.caption.isNotBlank())
@@ -689,17 +783,72 @@ fun PostCard(
 }
 
 
+
+@Composable
+fun FollowCounts(followers: Int, following: Int, onFollowers: () -> Unit, onFollowing: () -> Unit) {
+    Row {
+        Text("$followers followers", fontWeight = FontWeight.Medium, modifier = Modifier.clickable { onFollowers() })
+        Text("  ·  ")
+        Text("$following following", fontWeight = FontWeight.Medium, modifier = Modifier.clickable { onFollowing() })
+    }
+}
+
+@Composable
+fun FollowListDialog(vm: AppVm, username: String, kind: String, onClose: () -> Unit) {
+    var users by remember { mutableStateOf<List<Profile>?>(null) }
+    var userView by remember { mutableStateOf<String?>(null) }
+    LaunchedEffect(username, kind) {
+        try { users = vm.api.followList(username, kind) }
+        catch (e: CancellationException) { throw e }
+        catch (e: Exception) { vm.toast(e.message); users = emptyList() }
+    }
+    Dialog(onDismissRequest = onClose, properties = DialogProperties(usePlatformDefaultWidth = false)) {
+        Surface(Modifier.fillMaxSize()) {
+            Column(Modifier.padding(top = 24.dp)) {
+                Row(Modifier.padding(horizontal = 8.dp), verticalAlignment = Alignment.CenterVertically) {
+                    IconButton(onClose) { Icon(Icons.Filled.Close, "Close") }
+                    Text(if (kind == "followers") "Followers" else "Following", fontWeight = FontWeight.Bold, fontSize = 18.sp)
+                }
+                val list = users
+                if (list == null) Text("Loading…", Modifier.padding(16.dp), color = Color.Gray)
+                else if (list.isEmpty()) Text(if (kind == "followers") "No followers yet." else "Not following anyone yet.", Modifier.padding(16.dp), color = Color.Gray)
+                else LazyColumn {
+                    items(list, key = { it.username }) { u ->
+                        Row(
+                            Modifier.fillMaxWidth().clickable { userView = u.username }.padding(horizontal = 16.dp, vertical = 8.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Avatar(u.username, u.avatar, Modifier.size(44.dp))
+                            Spacer(Modifier.width(12.dp))
+                            Column {
+                                Text(u.username, fontWeight = FontWeight.Bold)
+                                if (u.bio.isNotBlank()) Text(u.bio, color = Color.Gray, fontSize = 13.sp, maxLines = 1)
+                            }
+                        }
+                    }
+                }
+            }
+            userView?.let { UserScreen(vm, it) { userView = null } }
+        }
+    }
+}
+
 // ---------- Another user's profile ----------
 @Composable
 fun UserScreen(vm: AppVm, username: String, onClose: () -> Unit) {
     var profile by remember { mutableStateOf<Profile?>(null) }
     val posts = remember { mutableStateListOf<Post>() }
     var loading by remember { mutableStateOf(true) }
-    var photo by remember { mutableStateOf<String?>(null) }
+    var openPost by remember { mutableStateOf<Post?>(null) }
+    var followers by remember { mutableIntStateOf(0) }
+    var following by remember { mutableIntStateOf(0) }
+    var iFollow by remember { mutableStateOf(false) }
+    var listKind by remember { mutableStateOf<String?>(null) }
     LaunchedEffect(username) {
         try {
             val (p, list) = vm.api.user(username)
             profile = p; posts.clear(); posts.addAll(list)
+            followers = p.followers; following = p.following; iFollow = p.isFollowing
         } catch (e: CancellationException) { throw e }
         catch (e: Exception) { vm.toast(e.message) }
         loading = false
@@ -723,20 +872,34 @@ fun UserScreen(vm: AppVm, username: String, onClose: () -> Unit) {
                         Column {
                             Text(p.username, fontSize = 20.sp, fontWeight = FontWeight.Bold)
                             Text("${posts.size} posts  ·  ${posts.sumOf { it.likes }} likes", color = Color.Gray)
+                            FollowCounts(followers, following, { listKind = "followers" }, { listKind = "following" })
                         }
                     }
                     if (p.bio.isNotBlank()) Text(p.bio, Modifier.padding(horizontal = 16.dp, vertical = 8.dp))
+                    if (p.username != vm.me?.username) {
+                        if (iFollow)
+                            OutlinedButton(
+                                { vm.follow(p.username, false) { n -> iFollow = false; followers = n } },
+                                Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 4.dp), enabled = !vm.busy
+                            ) { Text("Following ✓") }
+                        else
+                            Button(
+                                { vm.follow(p.username, true) { n -> iFollow = true; followers = n } },
+                                Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 4.dp), enabled = !vm.busy
+                            ) { Text("Follow") }
+                    }
                     HorizontalDivider()
                     if (posts.isEmpty()) Text("No posts yet.", Modifier.padding(16.dp), color = Color.Gray)
                     LazyVerticalGrid(GridCells.Fixed(3), horizontalArrangement = Arrangement.spacedBy(2.dp), verticalArrangement = Arrangement.spacedBy(2.dp)) {
                         items(posts, key = { it.id }) {
                             AsyncImage(it.image, null, contentScale = ContentScale.Crop,
-                                modifier = Modifier.aspectRatio(1f).clickable { photo = it.image })
+                                modifier = Modifier.aspectRatio(1f).clickable { openPost = it })
                         }
                     }
                 }
             }
-            photo?.let { PhotoViewer(it) { photo = null } }
+            openPost?.let { p -> PostDetail(vm, p, onDeleted = { posts.remove(p) }) { openPost = null } }
+            listKind?.let { FollowListDialog(vm, username, it) { listKind = null } }
         }
     }
 }
@@ -823,10 +986,11 @@ fun NewPost(vm: AppVm, onDone: () -> Unit) {
 fun ProfileScreen(vm: AppVm) {
     val me = vm.me!!
     val mine = vm.posts.filter { it.user == me.username }
-    var photo by remember { mutableStateOf<String?>(null) }
+    var openPost by remember { mutableStateOf<Post?>(null) }
     var editing by remember { mutableStateOf(false) }
     var emailOpen by remember { mutableStateOf(false) }
     var vipOpen by remember { mutableStateOf(false) }
+    var listKind by remember { mutableStateOf<String?>(null) }
     val ctx = LocalContext.current
     var draftName by remember { mutableStateOf("") }
     var draftBio by remember { mutableStateOf("") }
@@ -843,6 +1007,7 @@ fun ProfileScreen(vm: AppVm) {
             Column(Modifier.weight(1f)) {
                 Text(if (me.vip) "${me.username}  ⭐ VIP" else me.username, fontSize = 20.sp, fontWeight = FontWeight.Bold)
                 Text("${mine.size} posts  ·  ${mine.sumOf { it.likes }} likes", color = Color.Gray)
+                FollowCounts(me.followers, me.following, { listKind = "followers" }, { listKind = "following" })
             }
             TextButton({ vm.logout() }) { Text("Log out") }
         }
@@ -865,7 +1030,11 @@ fun ProfileScreen(vm: AppVm) {
                     color = Color(0xFFB45309), fontSize = 13.sp, modifier = Modifier.weight(1f)
                 )
                 if (me.vipUntil != null)
-                    TextButton({ vm.openPortal { url -> openWeb(ctx, url) } }) { Text("Manage") }
+                    TextButton({
+                        if (USE_PLAY_BILLING)
+                            ctx.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse("https://play.google.com/store/account/subscriptions?sku=$PLAY_PRODUCT_ID&package=${ctx.packageName}")))
+                        else vm.openPortal { url -> openWeb(ctx, url) }
+                    }) { Text("Manage") }
             }
         } else {
             Button({ vipOpen = true }, Modifier.padding(horizontal = 16.dp)) { Text("⭐ Get VIP") }
@@ -879,11 +1048,12 @@ fun ProfileScreen(vm: AppVm) {
         LazyVerticalGrid(GridCells.Fixed(3), horizontalArrangement = Arrangement.spacedBy(2.dp), verticalArrangement = Arrangement.spacedBy(2.dp)) {
             items(mine, key = { it.id }) {
                 AsyncImage(it.image, null, contentScale = ContentScale.Crop,
-                    modifier = Modifier.aspectRatio(1f).clickable { photo = it.image })
+                    modifier = Modifier.aspectRatio(1f).clickable { openPost = it })
             }
         }
     }
-    photo?.let { PhotoViewer(it) { photo = null } }
+    openPost?.let { PostDetail(vm, it) { openPost = null } }
+    listKind?.let { FollowListDialog(vm, me.username, it) { listKind = null } }
     if (emailOpen) EmailDialog(vm) { emailOpen = false }
     if (vipOpen) VipDialog(vm) { vipOpen = false }
 

@@ -2,7 +2,7 @@
 """Viora server: REST API + image hosting. Pure Python 3.8+ standard library, SQLite storage.
 Run:  python3 server.py   (env: PORT=8000, DATABASE_URL=postgres://... or VIORA_DATA=./data for SQLite)
 """
-import hashlib, hmac, json, math, os, re, secrets, sqlite3, time, traceback, urllib.error, urllib.parse, urllib.request
+import base64, datetime, hashlib, hmac, json, math, os, re, secrets, sqlite3, time, traceback, urllib.error, urllib.parse, urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
@@ -30,6 +30,7 @@ SCHEMA = [
  "CREATE TABLE IF NOT EXISTS likes(post_id INTEGER REFERENCES posts(id) ON DELETE CASCADE, user_id INTEGER REFERENCES users(id) ON DELETE CASCADE, PRIMARY KEY(post_id, user_id))",
  f"CREATE TABLE IF NOT EXISTS comments(id {PK}, post_id INTEGER NOT NULL REFERENCES posts(id) ON DELETE CASCADE, user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE, text TEXT NOT NULL, created DOUBLE PRECISION)",
  f"CREATE TABLE IF NOT EXISTS codes(id {PK}, user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE, kind TEXT NOT NULL, email TEXT NOT NULL, code_hash TEXT NOT NULL, expires DOUBLE PRECISION, created DOUBLE PRECISION, attempts INTEGER NOT NULL DEFAULT 0)",
+ "CREATE TABLE IF NOT EXISTS follows(follower_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE, followee_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE, created DOUBLE PRECISION, PRIMARY KEY(follower_id, followee_id))",
  f"CREATE TABLE IF NOT EXISTS stories(id {PK}, user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE, image TEXT NOT NULL, created DOUBLE PRECISION)",
 ]
 INTEGRITY = (sqlite3.IntegrityError, psycopg2.IntegrityError) if PG else (sqlite3.IntegrityError,)
@@ -56,7 +57,7 @@ def db(): return DB()
 
 with db() as _c:
     for _s in SCHEMA: _c.execute(_s)
-for _col, _typ in (("email", "TEXT"), ("email_verified", "INTEGER NOT NULL DEFAULT 0"), ("is_vip", "INTEGER NOT NULL DEFAULT 0"), ("vip_until", "DOUBLE PRECISION"), ("stripe_customer", "TEXT")):
+for _col, _typ in (("email", "TEXT"), ("email_verified", "INTEGER NOT NULL DEFAULT 0"), ("is_vip", "INTEGER NOT NULL DEFAULT 0"), ("vip_until", "DOUBLE PRECISION"), ("stripe_customer", "TEXT"), ("play_token", "TEXT")):
     try:  # add columns to databases created before email support existed
         with db() as _c: _c.execute(f"ALTER TABLE users ADD COLUMN {'IF NOT EXISTS ' if PG else ''}{_col} {_typ}")
     except Exception:
@@ -194,6 +195,80 @@ def apply_subscription(c, sub):
     end = float(sub_period_end(sub)) if paid and sub_period_end(sub) else None
     c.execute("UPDATE users SET vip_until=?, stripe_customer=COALESCE(?, stripe_customer) WHERE id=?", (end, cust, row["id"]))
 
+def account_id(uid):
+    """Opaque id attached to Google Play purchases so a purchase can be tied to one Viora account."""
+    return hashlib.sha256(f"viora:{uid}".encode()).hexdigest()[:32]
+
+# ---- Google Play Billing (server-side verification, service account auth) ----
+GOOGLE_API = "https://androidpublisher.googleapis.com/androidpublisher/v3/applications"
+_gtoken = {"v": None, "exp": 0.0}
+
+def _b64u(b):
+    return base64.urlsafe_b64encode(b).rstrip(b"=").decode()
+
+def google_access_token():
+    if _gtoken["v"] and time.time() < _gtoken["exp"] - 60: return _gtoken["v"]
+    raw = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON")
+    if not raw: raise HTTPError(503, "Google Play billing is not set up on this server yet")
+    try:
+        from cryptography.hazmat.primitives import hashes, serialization
+        from cryptography.hazmat.primitives.asymmetric import padding
+        sa = json.loads(raw); now = int(time.time())
+        head = _b64u(json.dumps({"alg": "RS256", "typ": "JWT"}).encode())
+        claims = _b64u(json.dumps({"iss": sa["client_email"], "scope": "https://www.googleapis.com/auth/androidpublisher",
+                                   "aud": "https://oauth2.googleapis.com/token", "iat": now, "exp": now + 3600}).encode())
+        key = serialization.load_pem_private_key(sa["private_key"].encode(), password=None)
+        sig = key.sign(f"{head}.{claims}".encode(), padding.PKCS1v15(), hashes.SHA256())
+        data = urllib.parse.urlencode({"grant_type": "urn:ietf:params:oauth:grant-type:jwt-bearer",
+                                       "assertion": f"{head}.{claims}.{_b64u(sig)}"}).encode()
+        r = json.loads(urllib.request.urlopen(urllib.request.Request("https://oauth2.googleapis.com/token", data=data), timeout=20).read())
+        _gtoken["v"], _gtoken["exp"] = r["access_token"], time.time() + int(r.get("expires_in", 3600))
+        return _gtoken["v"]
+    except Exception:
+        traceback.print_exc()
+        raise HTTPError(502, "Couldn't sign in to Google Play. Check GOOGLE_SERVICE_ACCOUNT_JSON.")
+
+def google_request(method, url, body=None):
+    token = google_access_token()
+    req = urllib.request.Request(url, method=method, data=json.dumps(body).encode() if body is not None else None,
+                                 headers={"Authorization": "Bearer " + token, "Content-Type": "application/json"})
+    try:
+        raw = urllib.request.urlopen(req, timeout=20).read()
+        return json.loads(raw) if raw else {}
+    except urllib.error.HTTPError as e:
+        detail = e.read()[:400]
+        print("google play error:", e.code, detail, flush=True)
+        raise HTTPError(400 if e.code in (400, 404, 410) else 502, "Google Play couldn't confirm this purchase")
+    except Exception:
+        traceback.print_exc()
+        raise HTTPError(502, "Couldn't reach Google Play")
+
+def parse_rfc3339(s):
+    return datetime.datetime.fromisoformat(re.sub(r"\.\d+", "", s).replace("Z", "+00:00")).timestamp()
+
+def google_apply(c, uid, token, acknowledge):
+    pkg = os.environ.get("GOOGLE_PLAY_PACKAGE", "io.github.jimchen67868.viora")
+    product = os.environ.get("GOOGLE_PLAY_PRODUCT_ID", "viora_vip")
+    quoted = urllib.parse.quote(token, safe="")
+    sub = google_request("GET", f"{GOOGLE_API}/{pkg}/purchases/subscriptionsv2/tokens/{quoted}")
+    items = [li for li in sub.get("lineItems", []) if li.get("productId") == product]
+    if not items: raise HTTPError(400, "This purchase isn't for Viora VIP")
+    acct = (sub.get("externalAccountIdentifiers") or {}).get("obfuscatedExternalAccountId")
+    if acct and acct != account_id(uid): raise HTTPError(403, "This purchase belongs to a different account")
+    if c.execute("SELECT 1 FROM users WHERE play_token=? AND id<>?", (token, uid)).fetchone():
+        raise HTTPError(409, "This purchase is already linked to another account")
+    ends = [parse_rfc3339(li["expiryTime"]) for li in items if li.get("expiryTime")]
+    end = max(ends) if ends else 0
+    entitled = sub.get("subscriptionState") in ("SUBSCRIPTION_STATE_ACTIVE", "SUBSCRIPTION_STATE_CANCELED",
+                                                "SUBSCRIPTION_STATE_IN_GRACE_PERIOD") and end > time.time()
+    if entitled and acknowledge and sub.get("acknowledgementState") == "ACKNOWLEDGEMENT_STATE_PENDING":
+        google_request("POST", f"{GOOGLE_API}/{pkg}/purchases/subscriptions/{product}/tokens/{quoted}:acknowledge", {})
+    cur = c.execute("SELECT play_token FROM users WHERE id=?", (uid,)).fetchone()
+    if entitled:
+        c.execute("UPDATE users SET vip_until=?, play_token=? WHERE id=?", (end, token, uid))
+    elif cur["play_token"] == token:  # this Play subscription ended or was refunded
+        c.execute("UPDATE users SET vip_until=NULL WHERE id=?", (uid,))
+
 ROUTES = []
 def route(method, pattern):
     def deco(fn):
@@ -248,8 +323,12 @@ class H(BaseHTTPRequestHandler):
         return f"{proto}://{self.headers.get('Host', 'localhost')}/uploads/{f}"
 
     def profile(self, u):
+        with db() as c:
+            fr = c.execute("SELECT COUNT(*) AS n FROM follows WHERE followee_id=?", (u["id"],)).fetchone()["n"]
+            fg = c.execute("SELECT COUNT(*) AS n FROM follows WHERE follower_id=?", (u["id"],)).fetchone()["n"]
         return {"username": u["username"], "bio": u["bio"], "avatar": self.url(u["avatar"]),
                 "email": u["email"], "email_verified": bool(u["email_verified"]), "vip": vip_active(u),
+                "followers": fr, "following": fg, "account_id": account_id(u["id"]),
                 "vip_until": (u["vip_until"] if not u["is_vip"] and (u["vip_until"] or 0) > time.time() else None)}
 
     def post_json(self, c, uid, where="", args=(), limit=100):
@@ -460,8 +539,12 @@ def user_profile(h, q, name):
         u = c.execute("SELECT * FROM users WHERE LOWER(username)=LOWER(?)", (name,)).fetchone()
         if not u: raise HTTPError(404, "User not found")
         posts = h.post_json(c, me["id"], "WHERE p.user_id=?", (u["id"],))
+        fr = c.execute("SELECT COUNT(*) AS n FROM follows WHERE followee_id=?", (u["id"],)).fetchone()["n"]
+        fg = c.execute("SELECT COUNT(*) AS n FROM follows WHERE follower_id=?", (u["id"],)).fetchone()["n"]
+        isf = c.execute("SELECT 1 FROM follows WHERE follower_id=? AND followee_id=?", (me["id"], u["id"])).fetchone() is not None
     # public view: never include the email
-    h.send_json(200, {"user": {"username": u["username"], "bio": u["bio"], "avatar": h.url(u["avatar"])}, "posts": posts})
+    h.send_json(200, {"user": {"username": u["username"], "bio": u["bio"], "avatar": h.url(u["avatar"]),
+                               "followers": fr, "following": fg, "is_following": isf}, "posts": posts})
 
 @route("GET", "/api/search")
 def search(h, q):
@@ -575,6 +658,62 @@ def stripe_webhook(h, q):
         elif kind in ("customer.subscription.created", "customer.subscription.updated", "customer.subscription.deleted"):
             apply_subscription(c, obj)
     h.send_json(200, {"received": True})
+
+@route("POST", "/api/billing/google/verify")
+def google_verify(h, q):
+    token = str(h.json_body().get("purchase_token", "")).strip()
+    if not token or len(token) > 2000: raise HTTPError(400, "Missing purchase token")
+    with db() as c:
+        u = h.user(c)
+        google_apply(c, u["id"], token, acknowledge=True)
+        u = c.execute("SELECT * FROM users WHERE id=?", (u["id"],)).fetchone()
+    h.send_json(200, {"user": h.profile(u)})
+
+@route("POST", "/api/billing/google/sync")
+def google_sync(h, q):
+    """Re-checks the user's stored Play subscription with Google (catches cancellations, expiry and refunds)."""
+    with db() as c:
+        u = h.user(c)
+        if u["play_token"]:
+            google_apply(c, u["id"], u["play_token"], acknowledge=False)
+            u = c.execute("SELECT * FROM users WHERE id=?", (u["id"],)).fetchone()
+    h.send_json(200, {"user": h.profile(u)})
+
+def target_user(c, name):
+    t = c.execute("SELECT * FROM users WHERE LOWER(username)=LOWER(?)", (name,)).fetchone()
+    if not t: raise HTTPError(404, "User not found")
+    return t
+
+def follower_count(c, uid):
+    return c.execute("SELECT COUNT(*) AS n FROM follows WHERE followee_id=?", (uid,)).fetchone()["n"]
+
+@route("POST", r"/api/users/([A-Za-z0-9_.]{3,20})/follow")
+def follow(h, q, name):
+    with db() as c:
+        me = h.user(c); t = target_user(c, name)
+        if t["id"] == me["id"]: raise HTTPError(400, "You can't follow yourself")
+        c.execute("INSERT INTO follows(follower_id,followee_id,created) VALUES(?,?,?) ON CONFLICT DO NOTHING", (me["id"], t["id"], time.time()))
+        n = follower_count(c, t["id"])
+    h.send_json(200, {"following": True, "followers": n})
+
+@route("DELETE", r"/api/users/([A-Za-z0-9_.]{3,20})/follow")
+def unfollow(h, q, name):
+    with db() as c:
+        me = h.user(c); t = target_user(c, name)
+        c.execute("DELETE FROM follows WHERE follower_id=? AND followee_id=?", (me["id"], t["id"]))
+        n = follower_count(c, t["id"])
+    h.send_json(200, {"following": False, "followers": n})
+
+@route("GET", r"/api/users/([A-Za-z0-9_.]{3,20})/(followers|following)")
+def follow_list(h, q, name, kind):
+    with db() as c:
+        h.user(c); t = target_user(c, name)
+        if kind == "followers":
+            sql = "SELECT u.username, u.bio, u.avatar FROM follows f JOIN users u ON u.id=f.follower_id WHERE f.followee_id=? ORDER BY f.created DESC LIMIT 200"
+        else:
+            sql = "SELECT u.username, u.bio, u.avatar FROM follows f JOIN users u ON u.id=f.followee_id WHERE f.follower_id=? ORDER BY f.created DESC LIMIT 200"
+        rows = c.execute(sql, (t["id"],)).fetchall()
+    h.send_json(200, {"users": [{"username": r["username"], "bio": r["bio"], "avatar": h.url(r["avatar"])} for r in rows]})
 
 @route("GET", "/api/posts")
 def list_posts(h, q):
