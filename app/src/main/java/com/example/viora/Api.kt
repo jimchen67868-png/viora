@@ -30,16 +30,17 @@ class ApiException(val code: Int, message: String) : Exception(message)
 class Profile(
     val username: String, val bio: String, val avatar: String?,
     val email: String? = null, val emailVerified: Boolean = false, val vip: Boolean = false, val vipUntil: Long? = null, val accountId: String? = null,
-    val followers: Int = 0, val following: Int = 0, val isFollowing: Boolean = false
+    val followers: Int = 0, val following: Int = 0, val isFollowing: Boolean = false,
+    val followingPrivacy: String = "everyone"
 )
 class Plan(val id: String, val name: String, val price: String)
-class Comment(val user: String, val avatar: String?, val text: String)
+class Comment(val user: String, val avatar: String?, val text: String, val created: Long = 0)
 class Story(val user: String, val avatar: String?, val images: List<String>)
 
 class Post(
     val id: Int, val user: String, val avatar: String?, val image: String,
     initialCaption: String, initialLikes: Int, initialLiked: Boolean, initialCommentCount: Int,
-    val kind: String = "image", val thumb: String? = null
+    val kind: String = "image", val thumb: String? = null, val created: Long = 0
 ) {
     val isVideo: Boolean get() = kind == "video"
     /** What to show as the picture: the photo itself, or a video's poster frame. */
@@ -69,12 +70,13 @@ private fun JSONObject.toProfile() =
     Profile(getString("username"), optString("bio", ""), str("avatar"), str("email"), optBoolean("email_verified", false), optBoolean("vip", false),
         if (has("vip_until") && !isNull("vip_until")) getLong("vip_until") else null,
         str("account_id"),
-        followers = optInt("followers", 0), following = optInt("following", 0), isFollowing = optBoolean("is_following", false))
-private fun JSONObject.toComment() = Comment(getString("user"), str("avatar"), getString("text"))
+        followers = optInt("followers", 0), following = optInt("following", 0), isFollowing = optBoolean("is_following", false),
+        followingPrivacy = optString("following_privacy", "everyone"))
+private fun JSONObject.toComment() = Comment(getString("user"), str("avatar"), getString("text"), optLong("created", 0L))
 private fun JSONObject.toPost() = Post(
     getInt("id"), getString("user"), str("avatar"), getString("image"),
     getString("caption"), getInt("likes"), getBoolean("liked"), getInt("comments"),
-    optString("kind", "image"), str("thumb")
+    optString("kind", "image"), str("thumb"), optLong("created", 0L)
 )
 
 class Api(var base: String, var token: String?) {
@@ -115,6 +117,8 @@ class Api(var base: String, var token: String?) {
     suspend fun resetPassword(email: String, code: String, password: String) {
         send("POST", "/api/password/reset", json("email" to email, "code" to code, "password" to password))
     }
+    suspend fun setFollowingPrivacy(mode: String) =
+        send("PUT", "/api/me/privacy", json("following_privacy" to mode)).getJSONObject("user").toProfile()
     suspend fun removeAvatar() = send("DELETE", "/api/me/avatar").getJSONObject("user").toProfile()
 
     suspend fun posts(): List<Post> {

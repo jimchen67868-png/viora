@@ -60,7 +60,7 @@ def db(): return DB()
 
 with db() as _c:
     for _s in SCHEMA: _c.execute(_s)
-for _col, _typ in (("email", "TEXT"), ("email_verified", "INTEGER NOT NULL DEFAULT 0"), ("is_vip", "INTEGER NOT NULL DEFAULT 0"), ("vip_until", "DOUBLE PRECISION"), ("stripe_customer", "TEXT"), ("play_token", "TEXT")):
+for _col, _typ in (("email", "TEXT"), ("email_verified", "INTEGER NOT NULL DEFAULT 0"), ("is_vip", "INTEGER NOT NULL DEFAULT 0"), ("vip_until", "DOUBLE PRECISION"), ("stripe_customer", "TEXT"), ("play_token", "TEXT"), ("following_privacy", "TEXT NOT NULL DEFAULT 'everyone'")):
     try:  # add columns to databases created before email support existed
         with db() as _c: _c.execute(f"ALTER TABLE users ADD COLUMN {'IF NOT EXISTS ' if PG else ''}{_col} {_typ}")
     except Exception:
@@ -443,17 +443,17 @@ class H(BaseHTTPRequestHandler):
             fg = c.execute("SELECT COUNT(*) AS n FROM follows WHERE follower_id=?", (u["id"],)).fetchone()["n"]
         return {"username": u["username"], "bio": u["bio"], "avatar": self.url(u["avatar"]),
                 "email": u["email"], "email_verified": bool(u["email_verified"]), "vip": vip_active(u),
-                "followers": fr, "following": fg, "account_id": account_id(u["id"]),
+                "followers": fr, "following": fg, "account_id": account_id(u["id"]), "following_privacy": u["following_privacy"] or "everyone",
                 "vip_until": (u["vip_until"] if not u["is_vip"] and (u["vip_until"] or 0) > time.time() else None)}
 
     def post_json(self, c, uid, where="", args=(), limit=100):
-        rows = c.execute(f"""SELECT p.id, p.caption, p.image, p.kind, p.thumb, u.username, u.avatar,
+        rows = c.execute(f"""SELECT p.id, p.caption, p.image, p.kind, p.thumb, p.created, u.username, u.avatar,
             (SELECT COUNT(*) FROM likes WHERE post_id=p.id) AS likes,
             EXISTS(SELECT 1 FROM likes WHERE post_id=p.id AND user_id=?) AS liked,
             (SELECT COUNT(*) FROM comments WHERE post_id=p.id) AS comments
             FROM posts p JOIN users u ON u.id=p.user_id {where} ORDER BY p.id DESC LIMIT {int(limit)}""", (uid, *args)).fetchall()
         return [{"id": r["id"], "user": r["username"], "avatar": self.url(r["avatar"]), "image": self.url(r["image"]),
-                 "caption": r["caption"], "kind": r["kind"], "thumb": self.url(r["thumb"]), "likes": r["likes"], "liked": bool(r["liked"]), "comments": r["comments"]} for r in rows]
+                 "caption": r["caption"], "kind": r["kind"], "thumb": self.url(r["thumb"]), "likes": r["likes"], "liked": bool(r["liked"]), "comments": r["comments"], "created": int(r["created"] or 0)} for r in rows]
 
     # ---- dispatch ----
     def dispatch(self, method):
@@ -559,6 +559,16 @@ def update_me(h, q):
             c.execute("UPDATE users SET bio=?, username=? WHERE id=?", (bio, name, u["id"]))
         except INTEGRITY:
             raise HTTPError(409, "Username already taken")
+        u = c.execute("SELECT * FROM users WHERE id=?", (u["id"],)).fetchone()
+    h.send_json(200, {"user": h.profile(u)})
+
+@route("PUT", "/api/me/privacy")
+def set_privacy(h, q):
+    mode = str(h.json_body().get("following_privacy", "")).strip()
+    if mode not in ("everyone", "followers", "me"): raise HTTPError(400, "Invalid privacy option")
+    with db() as c:
+        u = h.user(c)
+        c.execute("UPDATE users SET following_privacy=? WHERE id=?", (mode, u["id"]))
         u = c.execute("SELECT * FROM users WHERE id=?", (u["id"],)).fetchone()
     h.send_json(200, {"user": h.profile(u)})
 
@@ -837,7 +847,13 @@ def unfollow(h, q, name):
 @route("GET", r"/api/users/([A-Za-z0-9_.]{3,20})/(followers|following)")
 def follow_list(h, q, name, kind):
     with db() as c:
-        h.user(c); t = target_user(c, name)
+        me = h.user(c); t = target_user(c, name)
+        if kind == "following" and t["id"] != me["id"]:
+            mode = t["following_privacy"] or "everyone"
+            if mode == "me":
+                raise HTTPError(403, "This person keeps who they follow private")
+            if mode == "followers" and not c.execute("SELECT 1 FROM follows WHERE follower_id=? AND followee_id=?", (me["id"], t["id"])).fetchone():
+                raise HTTPError(403, "Only followers can see who this person follows")
         if kind == "followers":
             sql = "SELECT u.username, u.bio, u.avatar FROM follows f JOIN users u ON u.id=f.follower_id WHERE f.followee_id=? ORDER BY f.created DESC LIMIT 200"
         else:
@@ -911,13 +927,13 @@ def like(h, q, pid):
     h.send_json(200, {"liked": liked, "likes": n})
 
 def comment_json(h, r):
-    return {"user": r["username"], "avatar": h.url(r["avatar"]), "text": r["text"]}
+    return {"user": r["username"], "avatar": h.url(r["avatar"]), "text": r["text"], "created": int(r["created"] or 0)}
 
 @route("GET", r"/api/posts/(\d+)/comments")
 def list_comments(h, q, pid):
     with db() as c:
         h.user(c)
-        rows = c.execute("""SELECT c.text, u.username, u.avatar FROM comments c JOIN users u ON u.id=c.user_id
+        rows = c.execute("""SELECT c.text, c.created, u.username, u.avatar FROM comments c JOIN users u ON u.id=c.user_id
                             WHERE c.post_id=? ORDER BY c.id""", (pid,)).fetchall()
     h.send_json(200, {"comments": [comment_json(h, r) for r in rows]})
 
@@ -928,8 +944,9 @@ def add_comment(h, q, pid):
     with db() as c:
         u = h.user(c)
         if not c.execute("SELECT 1 FROM posts WHERE id=?", (pid,)).fetchone(): raise HTTPError(404, "Post not found")
-        c.execute("INSERT INTO comments(post_id,user_id,text,created) VALUES(?,?,?,?)", (pid, u["id"], text, time.time()))
-    h.send_json(201, {"comment": {"user": u["username"], "avatar": h.url(u["avatar"]), "text": text}})
+        now = time.time()
+        c.execute("INSERT INTO comments(post_id,user_id,text,created) VALUES(?,?,?,?)", (pid, u["id"], text, now))
+    h.send_json(201, {"comment": {"user": u["username"], "avatar": h.url(u["avatar"]), "text": text, "created": int(now)}})
 
 @route("GET", "/api/stories")
 def list_stories(h, q):

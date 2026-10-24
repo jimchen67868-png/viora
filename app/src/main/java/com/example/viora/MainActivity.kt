@@ -200,6 +200,7 @@ class AppVm(app: Application) : AndroidViewModel(app) {
             forYou.clear(); forYou.addAll(list); forYouPersonal = personal
         } catch (e: ApiException) { if (e.code == 403) feedMode = 0; throw e }
     }
+    fun setFollowingPrivacy(mode: String) = safe { saveMe(api.setFollowingPrivacy(mode)) }
     fun openForYou() { feedMode = 1; safe { loadForYou() } }
     private suspend fun loadFollowing() { val l = api.following(); followingPosts.clear(); followingPosts.addAll(l) }
     fun openFollowing() { feedMode = 2; safe { loadFollowing() } }
@@ -457,6 +458,17 @@ fun sharePost(ctx: Context, p: Post) {
     ctx.startActivity(Intent.createChooser(send, "Share post"))
 }
 
+fun timeAgo(epochSeconds: Long): String {
+    if (epochSeconds <= 0) return ""
+    val s = System.currentTimeMillis() / 1000 - epochSeconds
+    return when {
+        s < 60 -> "just now"
+        s < 3600 -> "${s / 60} min ago"
+        s < 86400 -> "${s / 3600} h ago"
+        s < 7 * 86400 -> "${s / 86400} d ago"
+        else -> fmtDate(epochSeconds)
+    }
+}
 fun fmtDate(epochSeconds: Long): String = DateFormat.getDateInstance(DateFormat.MEDIUM).format(Date(epochSeconds * 1000))
 
 @Composable
@@ -884,6 +896,7 @@ fun PostCard(
             color = Color.Gray,
             modifier = Modifier.padding(horizontal = 12.dp, vertical = 2.dp).clickable { onComments() }
         )
+        if (p.created > 0) Text(timeAgo(p.created).uppercase(), color = Color.Gray, fontSize = 11.sp, modifier = Modifier.padding(horizontal = 12.dp))
     }
 }
 
@@ -902,9 +915,11 @@ fun FollowCounts(followers: Int, following: Int, onFollowers: () -> Unit, onFoll
 fun FollowListDialog(vm: AppVm, username: String, kind: String, onClose: () -> Unit) {
     var users by remember { mutableStateOf<List<Profile>?>(null) }
     var userView by remember { mutableStateOf<String?>(null) }
+    var denied by remember { mutableStateOf<String?>(null) }
     LaunchedEffect(username, kind) {
         try { users = vm.api.followList(username, kind) }
         catch (e: CancellationException) { throw e }
+        catch (e: ApiException) { if (e.code == 403) denied = e.message else vm.toast(e.message); users = emptyList() }
         catch (e: Exception) { vm.toast(e.message); users = emptyList() }
     }
     Dialog(onDismissRequest = onClose, properties = DialogProperties(usePlatformDefaultWidth = false)) {
@@ -916,6 +931,7 @@ fun FollowListDialog(vm: AppVm, username: String, kind: String, onClose: () -> U
                 }
                 val list = users
                 if (list == null) Text("Loading…", Modifier.padding(16.dp), color = Color.Gray)
+                else if (denied != null) Text("🔒 $denied", Modifier.padding(16.dp), color = Color.Gray)
                 else if (list.isEmpty()) Text(if (kind == "followers") "No followers yet." else "Not following anyone yet.", Modifier.padding(16.dp), color = Color.Gray)
                 else LazyColumn {
                     items(list, key = { it.username }) { u ->
@@ -1040,7 +1056,10 @@ fun CommentsSheet(p: Post, vm: AppVm, onUser: (String) -> Unit, onClose: () -> U
                             Avatar(c.user, c.avatar, Modifier.size(36.dp))
                             Spacer(Modifier.width(12.dp))
                             Column {
-                                Text(c.user, fontWeight = FontWeight.Bold, fontSize = 13.sp)
+                                Row(verticalAlignment = Alignment.CenterVertically) {
+                                    Text(c.user, fontWeight = FontWeight.Bold, fontSize = 13.sp)
+                                    if (c.created > 0) Text("  " + timeAgo(c.created), color = Color.Gray, fontSize = 12.sp)
+                                }
                                 Text(c.text)
                             }
                         }
@@ -1112,6 +1131,7 @@ fun ProfileScreen(vm: AppVm) {
     var editing by remember { mutableStateOf(false) }
     var emailOpen by remember { mutableStateOf(false) }
     var vipOpen by remember { mutableStateOf(false) }
+    var privacyOpen by remember { mutableStateOf(false) }
     var listKind by remember { mutableStateOf<String?>(null) }
     val ctx = LocalContext.current
     var draftName by remember { mutableStateOf("") }
@@ -1144,6 +1164,11 @@ fun ProfileScreen(vm: AppVm) {
             color = if (me.email == null || unverified) Color(0xFFD97706) else Color.Gray,
             fontSize = 13.sp,
             modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp).clickable { emailOpen = true }
+        )
+        Text(
+            "🔒 Who can see who you follow: " + when (me.followingPrivacy) { "followers" -> "Followers"; "me" -> "Only me"; else -> "Everyone" },
+            color = Color.Gray, fontSize = 13.sp,
+            modifier = Modifier.padding(horizontal = 16.dp, vertical = 4.dp).clickable { privacyOpen = true }
         )
         if (me.vip) {
             Row(Modifier.padding(horizontal = 16.dp), verticalAlignment = Alignment.CenterVertically) {
@@ -1178,6 +1203,26 @@ fun ProfileScreen(vm: AppVm) {
     }
     openPost?.let { PostDetail(vm, it) { openPost = null } }
     listKind?.let { FollowListDialog(vm, me.username, it) { listKind = null } }
+    if (privacyOpen) {
+        AlertDialog(
+            onDismissRequest = { privacyOpen = false },
+            title = { Text("Who can see who you follow?") },
+            text = {
+                Column {
+                    for ((mode, label) in listOf("everyone" to "Everyone", "followers" to "Only my followers", "me" to "Only me")) {
+                        Row(
+                            Modifier.fillMaxWidth().clickable { vm.setFollowingPrivacy(mode); privacyOpen = false },
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            RadioButton(me.followingPrivacy == mode, { vm.setFollowingPrivacy(mode); privacyOpen = false })
+                            Text(label)
+                        }
+                    }
+                }
+            },
+            confirmButton = { TextButton({ privacyOpen = false }) { Text("Close") } }
+        )
+    }
     if (emailOpen) EmailDialog(vm) { emailOpen = false }
     if (vipOpen) VipDialog(vm) { vipOpen = false }
 
