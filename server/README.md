@@ -33,3 +33,9 @@ with "View financial data" + "Manage orders and subscriptions"), `GOOGLE_PLAY_PA
 The app sends the purchase token to `/api/billing/google/verify`; the server verifies it with the Play Developer API
 (`purchases.subscriptionsv2.get`), grants VIP until the expiry time and acknowledges the purchase.
 `/api/billing/google/sync` re-checks later so cancellations/refunds take effect.
+
+## Photo moderation (no sexual content)
+Set `OPENAI_API_KEY` and every uploaded photo (posts, stories, profile photos) is checked with OpenAI's free
+`omni-moderation-latest` model before it is saved; photos scored as sexual are rejected (HTTP 422). Optional:
+`MODERATION_THRESHOLD` (default 0.5; lower = stricter). If the check can't run, the upload is refused.
+Without the key, moderation is off.

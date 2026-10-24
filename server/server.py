@@ -79,9 +79,29 @@ def sniff(b):
     if b[:4] == b"GIF8": return "image/gif"
     return None
 
+def moderate_image(data, ctype):
+    """Blocks sexual content using OpenAI's free moderation endpoint (omni-moderation-latest supports images).
+    Off unless OPENAI_API_KEY is set. If the check itself fails, the upload is refused (fail closed)."""
+    key = os.environ.get("OPENAI_API_KEY")
+    if not key: return
+    url = os.environ.get("MODERATION_URL", "https://api.openai.com/v1/moderations")
+    threshold = float(os.environ.get("MODERATION_THRESHOLD", "0.5"))
+    body = json.dumps({"model": "omni-moderation-latest", "input": [
+        {"type": "image_url", "image_url": {"url": f"data:{ctype};base64,{base64.b64encode(data).decode()}"}}]}).encode()
+    req = urllib.request.Request(url, data=body, headers={"Authorization": "Bearer " + key, "Content-Type": "application/json"})
+    try:
+        res = json.loads(urllib.request.urlopen(req, timeout=25).read())["results"][0]
+    except Exception:
+        traceback.print_exc()
+        raise HTTPError(503, "Couldn't check this photo right now. Please try again in a moment.")
+    if res["categories"].get("sexual") or res["category_scores"].get("sexual", 0) >= threshold:
+        print("moderation: blocked an image, sexual score", res["category_scores"].get("sexual"), flush=True)
+        raise HTTPError(422, "This photo looks like it contains sexual content, so it can't be posted.")
+
 def save_image(c, b):
     ctype = sniff(b)
     if not ctype: raise HTTPError(400, "Unsupported or empty image")
+    moderate_image(b, ctype)
     data = psycopg2.Binary(b) if PG else b
     return str(c.execute("INSERT INTO images(ctype,data) VALUES(?,?) RETURNING id", (ctype, data)).fetchone()["id"])
 

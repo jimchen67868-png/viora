@@ -35,3 +35,5 @@ services:
         value: io.github.jimchen67868.viora
       - key: GOOGLE_PLAY_PRODUCT_ID
         value: viora_vip
+      - key: OPENAI_API_KEY
+        sync: false
