@@ -17,10 +17,10 @@ if PG:
     import psycopg2, psycopg2.extras
 DATA = os.environ.get("VIORA_DATA", "data")
 DB_FILE = os.path.join(DATA, "viora.db")
-MAX_BODY = 25 * 1024 * 1024        # request size cap (videos)
+MAX_BODY = 55 * 1024 * 1024        # request size cap (videos)
 MAX_IMAGE_BYTES = 12 * 1024 * 1024
-MAX_VIDEO_BYTES = 20 * 1024 * 1024
-MAX_VIDEO_SECONDS = 30
+MAX_VIDEO_BYTES = 50 * 1024 * 1024
+MAX_VIDEO_SECONDS = 15 * 60
 STORY_TTL = 24 * 3600
 if not PG: os.makedirs(DATA, exist_ok=True)
 
@@ -191,12 +191,68 @@ def video_frames(data, n=6):
         traceback.print_exc()
         raise HTTPError(400, "Couldn't read this video. Try a different file.")
     if not frames: raise HTTPError(400, "Couldn't read this video. Try a different file.")
-    if duration > MAX_VIDEO_SECONDS + 2: raise HTTPError(400, f"Videos can be at most {MAX_VIDEO_SECONDS} seconds")
+    if duration > MAX_VIDEO_SECONDS + 5: raise HTTPError(400, f"Videos can be at most {MAX_VIDEO_SECONDS // 60} minutes")
     return frames, duration
 
 def store_media(c, data, ctype):
     blob = psycopg2.Binary(data) if PG else data
     return str(c.execute("INSERT INTO images(ctype,data) VALUES(?,?) RETURNING id", (ctype, blob)).fetchone()["id"])
+
+# ---- Video storage: S3-compatible bucket (Cloudflare R2, Backblaze B2, AWS S3) instead of the database ----
+# Env, all required to switch it on: S3_ENDPOINT, S3_BUCKET, S3_ACCESS_KEY_ID, S3_SECRET_ACCESS_KEY, S3_PUBLIC_URL (optional S3_REGION, default "auto").
+# Without them videos keep being stored in the database as before.
+def s3_conf():
+    v = {k: os.environ.get(k, "").strip() for k in ("S3_ENDPOINT", "S3_BUCKET", "S3_ACCESS_KEY_ID", "S3_SECRET_ACCESS_KEY", "S3_PUBLIC_URL")}
+    if not all(v.values()): return None
+    v["S3_ENDPOINT"], v["S3_PUBLIC_URL"] = v["S3_ENDPOINT"].rstrip("/"), v["S3_PUBLIC_URL"].rstrip("/")
+    v["S3_REGION"] = os.environ.get("S3_REGION", "").strip() or "auto"
+    return v
+
+def sigv4_auth(method, path, hdrs, payload_hash, access, secret, region, amz_date):
+    """AWS Signature Version 4 Authorization header (no query string). hdrs: lowercase header names -> values to sign."""
+    day, signed = amz_date[:8], ";".join(sorted(hdrs))
+    canon = "\n".join([method, path, "", "".join(f"{k}:{hdrs[k]}\n" for k in sorted(hdrs)), signed, payload_hash])
+    scope = f"{day}/{region}/s3/aws4_request"
+    to_sign = "\n".join(["AWS4-HMAC-SHA256", amz_date, scope, hashlib.sha256(canon.encode()).hexdigest()])
+    k = ("AWS4" + secret).encode()
+    for part in (day, region, "s3", "aws4_request"): k = hmac.new(k, part.encode(), hashlib.sha256).digest()
+    sig = hmac.new(k, to_sign.encode(), hashlib.sha256).hexdigest()
+    return f"AWS4-HMAC-SHA256 Credential={access}/{scope}, SignedHeaders={signed}, Signature={sig}"
+
+def s3_request(method, key, body=b"", ctype=None):
+    cf = s3_conf()
+    if not cf: raise HTTPError(503, "Video storage is not set up on this server")
+    host = urllib.parse.urlparse(cf["S3_ENDPOINT"]).netloc
+    path = "/" + cf["S3_BUCKET"] + "/" + urllib.parse.quote(key, safe="/-_.~")
+    amz = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    phash = hashlib.sha256(body).hexdigest()
+    signed = {"host": host, "x-amz-content-sha256": phash, "x-amz-date": amz}
+    if ctype: signed["content-type"] = ctype
+    headers = {"x-amz-content-sha256": phash, "x-amz-date": amz,
+               "Authorization": sigv4_auth(method, path, signed, phash, cf["S3_ACCESS_KEY_ID"], cf["S3_SECRET_ACCESS_KEY"], cf["S3_REGION"], amz)}
+    if ctype: headers["Content-Type"] = ctype
+    if method == "PUT": headers["Cache-Control"] = "public, max-age=31536000, immutable"
+    req = urllib.request.Request(cf["S3_ENDPOINT"] + path, data=body if method == "PUT" else None, method=method, headers=headers)
+    try:
+        urllib.request.urlopen(req, timeout=300).read()
+    except urllib.error.HTTPError as e:
+        print("storage error:", method, key, e.code, e.read()[:300], flush=True)
+        raise HTTPError(502, "Couldn't save the video to storage")
+    except Exception:
+        traceback.print_exc()
+        raise HTTPError(502, "Couldn't reach video storage")
+
+def s3_delete_quiet(name):
+    try: s3_request("DELETE", str(name)[3:])
+    except Exception as e: print("storage: couldn't delete", name, getattr(e, "msg", e), flush=True)
+
+def store_video(c, data):
+    """Returns the name to keep in posts.image: 's3:<key>' for the bucket, or a database media id."""
+    if s3_conf():
+        key = f"videos/{secrets.token_hex(16)}.mp4"
+        s3_request("PUT", key, data, "video/mp4")
+        return "s3:" + key
+    return store_media(c, data, "video/mp4")
 
 def save_image(c, b):
     ctype = sniff(b)
@@ -205,7 +261,8 @@ def save_image(c, b):
     return store_media(c, b, ctype)
 
 def remove_image(c, name):
-    if name and str(name).isdigit(): c.execute("DELETE FROM images WHERE id=?", (int(name),))
+    if name and str(name).startswith("s3:"): s3_delete_quiet(name)
+    elif name and str(name).isdigit(): c.execute("DELETE FROM images WHERE id=?", (int(name),))
 
 EMAIL_RE = re.compile(r"[^@\s]+@[^@\s]+\.[^@\s]+")
 
@@ -471,6 +528,9 @@ class H(BaseHTTPRequestHandler):
 
     def url(self, f):
         if not f: return None
+        if str(f).startswith("s3:"):
+            cf = s3_conf()
+            return f"{cf['S3_PUBLIC_URL']}/{str(f)[3:]}" if cf else None
         proto = self.headers.get("X-Forwarded-Proto", "http")
         return f"{proto}://{self.headers.get('Host', 'localhost')}/uploads/{f}"
 
@@ -511,31 +571,37 @@ class H(BaseHTTPRequestHandler):
 
     def serve(self, name):
         if not name.isdigit(): raise HTTPError(404, "Not found")
+        mid = int(name)
         with db() as c:
-            r = c.execute("SELECT ctype, data FROM images WHERE id=?", (int(name),)).fetchone()
-        if not r: raise HTTPError(404, "Not found")
-        data = bytes(r["data"]); total = len(data); start, end, code = 0, total - 1, 200
-        rng = self.headers.get("Range", "")
-        if rng.startswith("bytes=") and total:  # videos need byte ranges to play and seek
-            a, _, b = rng[6:].split(",")[0].partition("-")
-            try:
-                if a == "": start = max(0, total - int(b))
-                else: start, end = int(a), (int(b) if b else total - 1)
-                end = min(end, total - 1); code = 206
-            except ValueError:
-                start, end, code = 0, total - 1, 200
-            if code == 206 and start > end:
-                self.send_response(416); self.send_header("Content-Range", f"bytes */{total}")
-                self.send_header("Content-Length", "0"); self.end_headers(); return
-        body = data[start:end + 1]
-        self.send_response(code)
-        self.send_header("Content-Type", r["ctype"])
-        self.send_header("Content-Length", str(len(body)))
-        self.send_header("Accept-Ranges", "bytes")
-        if code == 206: self.send_header("Content-Range", f"bytes {start}-{end}/{total}")
-        self.send_header("Cache-Control", "public, max-age=31536000, immutable")
-        self.end_headers()
-        self.wfile.write(body)
+            r = c.execute("SELECT ctype, LENGTH(data) AS total FROM images WHERE id=?", (mid,)).fetchone()
+            if not r: raise HTTPError(404, "Not found")
+            total = int(r["total"] or 0); start, end, code = 0, total - 1, 200
+            rng = self.headers.get("Range", "")
+            if rng.startswith("bytes=") and total:  # videos need byte ranges to play and seek
+                a, _, b = rng[6:].split(",")[0].partition("-")
+                try:
+                    if a == "": start = max(0, total - int(b))
+                    else: start, end = int(a), (int(b) if b else total - 1)
+                    end = min(end, total - 1); code = 206
+                except ValueError:
+                    start, end, code = 0, total - 1, 200
+                if code == 206 and start > end:
+                    self.send_response(416); self.send_header("Content-Range", f"bytes */{total}")
+                    self.send_header("Content-Length", "0"); self.end_headers(); return
+            self.send_response(code)
+            self.send_header("Content-Type", r["ctype"])
+            self.send_header("Content-Length", str(max(0, end - start + 1)))
+            self.send_header("Accept-Ranges", "bytes")
+            if code == 206: self.send_header("Content-Range", f"bytes {start}-{end}/{total}")
+            self.send_header("Cache-Control", "public, max-age=31536000, immutable")
+            self.end_headers()
+            pos = start  # read 4 MB at a time so a long video never sits fully in memory
+            while pos <= end:
+                n = min(4 * 1024 * 1024, end - pos + 1)
+                row = c.execute("SELECT SUBSTR(data, ?, ?) AS part FROM images WHERE id=?", (pos + 1, n, mid)).fetchone()
+                part = bytes(row["part"] or b"") if row else b""
+                if not part: break
+                self.wfile.write(part); pos += len(part)
 
     def do_GET(self): self.dispatch("GET")
     def do_POST(self): self.dispatch("POST")
@@ -921,17 +987,21 @@ def create_post(h, q):
     with db() as c:
         u = h.user(c); raw = h.body(); thumb = None
         if kind == "video":
-            if len(raw) > MAX_VIDEO_BYTES: raise HTTPError(413, "Video is too large (max 20 MB)")
+            if len(raw) > MAX_VIDEO_BYTES: raise HTTPError(413, f"Video is too large (max {MAX_VIDEO_BYTES // 1024 // 1024} MB)")
             if raw[4:8] != b"ftyp": raise HTTPError(400, "Please upload an MP4 video")
             frames, _ = video_frames(raw)
             moderate_images([(f, "image/jpeg") for f in frames])
             thumb = store_media(c, frames[len(frames) // 2], "image/jpeg")
-            name = store_media(c, raw, "video/mp4")
+            name = store_video(c, raw)
         else:
             name = save_image(c, raw)
-        pid = c.execute("INSERT INTO posts(user_id,image,caption,created,kind,thumb) VALUES(?,?,?,?,?,?) RETURNING id",
-                        (u["id"], name, caption, time.time(), kind, thumb)).fetchone()["id"]
-        post = h.post_json(c, u["id"], "WHERE p.id=?", (pid,))[0]
+        try:
+            pid = c.execute("INSERT INTO posts(user_id,image,caption,created,kind,thumb) VALUES(?,?,?,?,?,?) RETURNING id",
+                            (u["id"], name, caption, time.time(), kind, thumb)).fetchone()["id"]
+            post = h.post_json(c, u["id"], "WHERE p.id=?", (pid,))[0]
+        except Exception:
+            if str(name).startswith("s3:"): s3_delete_quiet(name)  # don't leave an orphaned file in the bucket
+            raise
     h.send_json(201, {"post": post})
 
 def own_post(c, u, pid):
@@ -1021,6 +1091,27 @@ def boost_checkout(h, q):
               "success_url": h.origin() + "/billing/return", "cancel_url": h.origin() + "/billing/return"}
     if email: params["customer_email"] = email
     h.send_json(200, {"url": stripe_api("POST", "/v1/checkout/sessions", params)["url"]})
+
+@route("POST", "/api/admin/migrate-videos")
+def migrate_videos(h, q):
+    """Moves a few existing database-stored videos to the bucket per call. Call repeatedly until remaining is 0."""
+    key = os.environ.get("ADMIN_KEY", "")
+    if not key or not hmac.compare_digest(h.headers.get("X-Admin-Key", "").encode(), key.encode()):
+        raise HTTPError(403, "Forbidden")
+    if not s3_conf(): raise HTTPError(503, "Set the S3_* variables on the server first")
+    moved = 0
+    with db() as c:
+        rows = c.execute("SELECT id, image FROM posts WHERE kind='video' AND SUBSTR(image,1,3)<>'s3:' ORDER BY id LIMIT 3").fetchall()
+        for r in rows:
+            if not str(r["image"]).isdigit(): continue
+            m = c.execute("SELECT data FROM images WHERE id=?", (int(r["image"]),)).fetchone()
+            if not m: continue
+            name = store_video(c, bytes(m["data"]))
+            c.execute("UPDATE posts SET image=? WHERE id=?", (name, r["id"]))
+            c.execute("DELETE FROM images WHERE id=?", (int(r["image"]),))
+            moved += 1
+        left = c.execute("SELECT COUNT(*) AS n FROM posts WHERE kind='video' AND SUBSTR(image,1,3)<>'s3:'").fetchone()["n"]
+    h.send_json(200, {"moved": moved, "remaining": int(left)})
 
 @route("POST", "/api/admin/boost")
 def admin_boost(h, q):

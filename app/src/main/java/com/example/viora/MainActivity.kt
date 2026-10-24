@@ -269,9 +269,10 @@ class AppVm(app: Application) : AndroidViewModel(app) {
         busy = true
         var file: File? = null
         try {
-            file = transcodeVideo(getApplication<Application>(), uri)
+            val durationMs = withContext(Dispatchers.IO) { videoDurationMs(getApplication<Application>(), uri) }
+            file = transcodeVideo(getApplication<Application>(), uri, durationMs)
             val bytes = withContext(Dispatchers.IO) { file!!.readBytes() }
-            if (bytes.size > 20 * 1024 * 1024) throw IllegalStateException("This video is still too large after compression. Choose a shorter clip.")
+            if (bytes.size > MAX_VIDEO_UPLOAD_BYTES) throw IllegalStateException("This video is still too large after compression. Choose a shorter clip.")
             posts.add(0, api.createVideoPost(bytes, caption))
             done()
         } finally { busy = false; file?.delete() }
@@ -655,20 +656,41 @@ fun StoryViewer(story: Story, onClose: () -> Unit) {
 }
 
 
-/** Trims to 30 s and re-encodes to 720p H.264 at about 2 Mbit/s so uploads stay small. Must be called on the main thread. */
+const val MAX_VIDEO_MINUTES = 15
+const val MAX_VIDEO_UPLOAD_BYTES = 50 * 1024 * 1024
+
+/** Length of a video in milliseconds, or 0 if it can't be read. */
+fun videoDurationMs(ctx: Context, uri: Uri): Long = try {
+    val r = MediaMetadataRetriever()
+    r.setDataSource(ctx, uri)
+    val d = r.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)?.toLongOrNull() ?: 0L
+    r.release()
+    d
+} catch (e: Exception) { 0L }
+
+/**
+ * Trims to the first 15 minutes and re-encodes to H.264. The longer the video, the lower the bitrate and resolution,
+ * so the file stays under the server's 50 MB limit (720p at 2 Mbit/s for short clips, 360p for 15 minutes).
+ * Must be called on the main thread.
+ */
 @OptIn(UnstableApi::class)
-suspend fun transcodeVideo(ctx: Context, uri: Uri): File = suspendCancellableCoroutine { cont ->
+suspend fun transcodeVideo(ctx: Context, uri: Uri, durationMs: Long): File = suspendCancellableCoroutine { cont ->
     val out = File(ctx.cacheDir, "upload_${System.currentTimeMillis()}.mp4")
+    val maxMs = MAX_VIDEO_MINUTES * 60_000L
+    val seconds = (if (durationMs > 0) minOf(durationMs, maxMs) else maxMs) / 1000.0
+    val budgetBits = 40.0 * 1024 * 1024 * 8   // aim well under the 50 MB cap: encoders often overshoot their target
+    val videoBps = (budgetBits / seconds - 128_000).coerceIn(150_000.0, 2_000_000.0).toInt()
+    val height = when { videoBps >= 1_200_000 -> 720; videoBps >= 500_000 -> 480; else -> 360 }
     val item = MediaItem.Builder().setUri(uri)
-        .setClippingConfiguration(MediaItem.ClippingConfiguration.Builder().setEndPositionMs(30_000).build()).build()
+        .setClippingConfiguration(MediaItem.ClippingConfiguration.Builder().setEndPositionMs(maxMs).build()).build()
     val edited = EditedMediaItem.Builder(item)
-        .setEffects(Effects(emptyList(), listOf(Presentation.createForHeight(720)))).build()
+        .setEffects(Effects(emptyList(), listOf(Presentation.createForHeight(height)))).build()
     val transformer = Transformer.Builder(ctx)
         .setVideoMimeType(MimeTypes.VIDEO_H264)
         .setAudioMimeType(MimeTypes.AUDIO_AAC)
         .setEncoderFactory(
             DefaultEncoderFactory.Builder(ctx)
-                .setRequestedVideoEncoderSettings(VideoEncoderSettings.Builder().setBitrate(2_000_000).build()).build()
+                .setRequestedVideoEncoderSettings(VideoEncoderSettings.Builder().setBitrate(videoBps).build()).build()
         )
         .addListener(object : Transformer.Listener {
             override fun onCompleted(composition: Composition, exportResult: ExportResult) { cont.resume(out) }
@@ -1224,6 +1246,10 @@ fun NewPost(vm: AppVm, onDone: () -> Unit) {
         val u = uri
         value = if (u != null && isVideo) withContext(Dispatchers.IO) { videoPoster(ctx, u) } else null
     }
+    val durationMs by produceState(0L, uri) {
+        val u = uri
+        value = if (u != null && isVideo) withContext(Dispatchers.IO) { videoDurationMs(ctx, u) } else 0L
+    }
     Column(Modifier.verticalScroll(rememberScrollState()).padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
         Text("New post", fontSize = 20.sp, fontWeight = FontWeight.Bold)
         Button({ picker.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageAndVideo)) }) {
@@ -1234,7 +1260,12 @@ fun NewPost(vm: AppVm, onDone: () -> Unit) {
                 poster?.let { Image(it.asImageBitmap(), null, contentScale = ContentScale.Fit, modifier = Modifier.fillMaxSize()) }
                 Icon(Icons.Filled.PlayArrow, null, tint = Color.White, modifier = Modifier.size(56.dp))
             }
-            Text("Videos are trimmed to 30 seconds and compressed before upload.", color = Color.Gray, fontSize = 12.sp)
+            val mins = durationMs / 60_000
+            val len = if (durationMs > 0) "  ·  ${mins}:${"%02d".format(durationMs / 1000 % 60)} long" else ""
+            Text("Videos can be up to $MAX_VIDEO_MINUTES minutes$len. Longer ones are trimmed to the first $MAX_VIDEO_MINUTES minutes, " +
+                "and long videos are compressed to a lower quality before upload.", color = Color.Gray, fontSize = 12.sp)
+            if (durationMs > MAX_VIDEO_MINUTES * 60_000L)
+                Text("⚠ Only the first $MAX_VIDEO_MINUTES minutes of this video will be posted.", color = Color(0xFFB26A00), fontSize = 13.sp)
         } else uri?.let { AsyncImage(it, null, contentScale = ContentScale.Crop, modifier = Modifier.fillMaxWidth().aspectRatio(1f)) }
         OutlinedTextField(caption, { caption = it }, label = { Text("Write a caption…") }, modifier = Modifier.fillMaxWidth())
         Button(
