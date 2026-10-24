@@ -116,6 +116,8 @@ class AppVm(app: Application) : AndroidViewModel(app) {
     val stories = mutableStateListOf<Story>()
     val forYou = mutableStateListOf<Post>()
     val followingPosts = mutableStateListOf<Post>()
+    var pendingPostId by mutableStateOf<Int?>(null)
+    var sharedPost by mutableStateOf<Post?>(null)
     val play = PlayBilling(app, { list -> onPlayPurchases(list) }, { msg -> toast(msg) })
     var forYouPersonal by mutableStateOf(true)
     var feedMode by mutableIntStateOf(0)
@@ -159,7 +161,7 @@ class AppVm(app: Application) : AndroidViewModel(app) {
     }
 
     fun logout() {
-        api.token = null; me = null; posts.clear(); stories.clear(); forYou.clear(); followingPosts.clear(); feedMode = 0
+        api.token = null; me = null; posts.clear(); stories.clear(); forYou.clear(); followingPosts.clear(); feedMode = 0; sharedPost = null
         prefs.edit().remove("token").apply()
     }
 
@@ -201,6 +203,12 @@ class AppVm(app: Application) : AndroidViewModel(app) {
         } catch (e: ApiException) { if (e.code == 403) feedMode = 0; throw e }
     }
     fun setFollowingPrivacy(mode: String) = safe { saveMe(api.setFollowingPrivacy(mode)) }
+    /** Opens the post from a shared link once the user is logged in. */
+    fun openPendingPost() {
+        val id = pendingPostId ?: return
+        pendingPostId = null
+        safe { sharedPost = api.post(id) }
+    }
     fun openForYou() { feedMode = 1; safe { loadForYou() } }
     private suspend fun loadFollowing() { val l = api.following(); followingPosts.clear(); followingPosts.addAll(l) }
     fun openFollowing() { feedMode = 2; safe { loadFollowing() } }
@@ -296,6 +304,18 @@ class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
         setContent { MaterialTheme { Surface { App() } } }
+        if (savedInstanceState == null) handleLink(intent)
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        handleLink(intent)
+    }
+
+    /** viora://p/123 or https://<server>/p/123 -> remember post 123 and open it. */
+    private fun handleLink(i: Intent?) {
+        val id = i?.data?.lastPathSegment?.toIntOrNull() ?: return
+        vm.pendingPostId = id
     }
 
     // Coming back from the payment page: reload the profile so VIP shows up.
@@ -309,6 +329,7 @@ class MainActivity : ComponentActivity() {
 fun App(vm: AppVm = viewModel()) {
     if (vm.me == null) { Login(vm); return }
     var tab by remember { mutableIntStateOf(0) }
+    LaunchedEffect(vm.pendingPostId) { if (vm.pendingPostId != null) vm.openPendingPost() }
     Scaffold(bottomBar = {
         NavigationBar {
             NavigationBarItem(tab == 0, { tab = 0 }, { Icon(Icons.Filled.Home, "Home") })
@@ -326,6 +347,7 @@ fun App(vm: AppVm = viewModel()) {
             }
         }
     }
+    vm.sharedPost?.let { PostDetail(vm, it) { vm.sharedPost = null } }
 }
 
 // ---------- Login ----------
@@ -452,7 +474,7 @@ fun sharePost(ctx: Context, p: Post) {
     val text = buildString {
         append(p.user).append(" on Viora")
         if (p.caption.isNotBlank()) append(": ").append(p.caption)
-        append("\n").append(p.image)
+        append("\n").append("$SERVER_URL/p/${p.id}")
     }
     val send = Intent(Intent.ACTION_SEND).apply { type = "text/plain"; putExtra(Intent.EXTRA_TEXT, text) }
     ctx.startActivity(Intent.createChooser(send, "Share post"))

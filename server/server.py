@@ -2,6 +2,7 @@
 """Viora server: REST API + image hosting. Pure Python 3.8+ standard library, SQLite storage.
 Run:  python3 server.py   (env: PORT=8000, DATABASE_URL=postgres://... or VIORA_DATA=./data for SQLite)
 """
+import html as htmllib
 import base64, datetime, hashlib, hmac, io, json, math, os, re, secrets, shutil, sqlite3, subprocess, tempfile, time, traceback, urllib.error, urllib.parse, urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
@@ -899,6 +900,56 @@ def own_post(c, u, pid):
     if not p: raise HTTPError(404, "Post not found")
     if p["user_id"] != u["id"]: raise HTTPError(403, "Not your post")
     return p
+
+@route("GET", r"/api/posts/(\d+)")
+def get_post(h, q, pid):
+    with db() as c:
+        u = h.user(c)
+        posts = h.post_json(c, u["id"], "WHERE p.id=?", (int(pid),))
+    if not posts: raise HTTPError(404, "Post not found")
+    h.send_json(200, {"post": posts[0]})
+
+SHARE_CSS = ("body{font-family:sans-serif;margin:0;background:#fafafa;color:#111}"
+             ".c{max-width:480px;margin:0 auto;background:#fff;min-height:100vh}"
+             ".h{padding:12px 16px;font-weight:bold}"
+             "img,video{width:100%;display:block}"
+             ".t{padding:12px 16px;white-space:pre-wrap;word-break:break-word}"
+             ".b{display:block;margin:16px;padding:14px;text-align:center;background:#6200ee;color:#fff;"
+             "text-decoration:none;border-radius:8px;font-weight:bold}"
+             ".s{color:#777;font-size:13px;text-align:center;padding:0 16px 24px}")
+
+@route("GET", r"/p/(\d+)")
+def share_page(h, q, pid):
+    """Public landing page for a shared post, with link-preview tags and an Open in Viora button."""
+    esc = htmllib.escape
+    with db() as c:
+        posts = h.post_json(c, 0, "WHERE p.id=?", (int(pid),))
+    if not posts:
+        return h.send_html(404, "<!doctype html><meta name=viewport content='width=device-width,initial-scale=1'>"
+                                "<body style='font-family:sans-serif;text-align:center;padding:3rem 1rem'>"
+                                "<h2>Post not found</h2><p>It may have been deleted.</p>")
+    p = posts[0]
+    base = f"{h.headers.get('X-Forwarded-Proto', 'http')}://{h.headers.get('Host', 'localhost')}"
+    title = f"{p['user']} on Viora"
+    desc = (p["caption"] or "")[:200]
+    pic = p["thumb"] if p["kind"] == "video" else p["image"]
+    head = ("<!doctype html><html><head><meta charset=utf-8>"
+            "<meta name=viewport content='width=device-width,initial-scale=1'>"
+            f"<title>{esc(title)}</title>"
+            f"<meta property=og:title content=\"{esc(title)}\">"
+            f"<meta property=og:description content=\"{esc(desc)}\">"
+            f"<meta property=og:url content=\"{esc(base)}/p/{p['id']}\">"
+            + (f"<meta property=og:image content=\"{esc(pic)}\"><meta name=twitter:card content=summary_large_image>" if pic else "")
+            + f"<style>{SHARE_CSS}</style></head>")
+    if p["kind"] == "video":
+        media = f"<video controls playsinline preload=metadata src=\"{esc(p['image'])}\"" + (f" poster=\"{esc(p['thumb'])}\"" if p["thumb"] else "") + "></video>"
+    else:
+        media = f"<img src=\"{esc(p['image'])}\" alt=\"\">"
+    body = (f"<body><div class=c><div class=h>{esc(p['user'])}</div>{media}"
+            + (f"<div class=t>{esc(p['caption'])}</div>" if p["caption"] else "")
+            + f"<a class=b href=\"viora://p/{p['id']}\">Open in Viora</a>"
+            "<div class=s>Install the Viora app to like, comment and follow.</div></div></body></html>")
+    h.send_html(200, head + body)
 
 @route("PUT", r"/api/posts/(\d+)")
 def edit_post(h, q, pid):
