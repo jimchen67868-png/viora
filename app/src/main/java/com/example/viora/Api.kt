@@ -38,12 +38,12 @@ class Story(val user: String, val avatar: String?, val images: List<String>)
 
 class Post(
     val id: Int, val user: String, val avatar: String?, val image: String,
-    caption: String, likes: Int, liked: Boolean, commentCount: Int
+    initialCaption: String, initialLikes: Int, initialLiked: Boolean, initialCommentCount: Int
 ) {
-    var caption by mutableStateOf(caption)
-    var likes by mutableIntStateOf(likes)
-    var liked by mutableStateOf(liked)
-    var commentCount by mutableIntStateOf(commentCount)
+    var caption by mutableStateOf(initialCaption)
+    var likes by mutableIntStateOf(initialLikes)
+    var liked by mutableStateOf(initialLiked)
+    var commentCount by mutableIntStateOf(initialCommentCount)
 }
 
 private fun JSONObject.str(k: String): String? = if (isNull(k)) null else getString(k)
