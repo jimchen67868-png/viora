@@ -1393,9 +1393,9 @@ fun ChatScreen(vm: AppVm, username: String, onClose: () -> Unit) {
     }
     LaunchedEffect(msgs.size) { if (msgs.isNotEmpty()) listState.scrollToItem(msgs.size - 1) }
     DisposableEffect(Unit) { onDispose { vm.refreshUnread() } }
-    Dialog(onDismissRequest = onClose, properties = DialogProperties(usePlatformDefaultWidth = false)) {
+    Dialog(onDismissRequest = onClose, properties = DialogProperties(usePlatformDefaultWidth = false, decorFitsSystemWindows = false)) {
         Surface(Modifier.fillMaxSize()) {
-            Column(Modifier.fillMaxSize().padding(top = 24.dp).imePadding()) {
+            Column(Modifier.fillMaxSize().safeDrawingPadding()) {   // keeps the text box above the keyboard and the navigation bar
                 Row(Modifier.padding(horizontal = 8.dp), verticalAlignment = Alignment.CenterVertically) {
                     IconButton(onClose) { Icon(Icons.Filled.Close, "Close") }
                     Text(username, fontWeight = FontWeight.Bold, fontSize = 18.sp)
