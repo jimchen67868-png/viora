@@ -33,6 +33,7 @@ import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.gestures.detectTransformGestures
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.lazy.grid.GridCells
@@ -150,6 +151,7 @@ class AppVm(app: Application) : AndroidViewModel(app) {
     var unreadMessages by mutableIntStateOf(0)
     var unreadActivity by mutableIntStateOf(0)
     var pendingChat by mutableStateOf<String?>(null)
+    var chatUser by mutableStateOf<String?>(null)   // the open chat, shown over the whole app
     var pendingUser by mutableStateOf<String?>(null)
 
     /** Registers this phone for push notifications. Does nothing in builds without google-services.json. */
@@ -242,7 +244,7 @@ class AppVm(app: Application) : AndroidViewModel(app) {
             catch (e: Exception) { }
         }
         prefs.edit().remove("push_token").remove("notified_total").apply()
-        unreadActivity = 0; pendingChat = null; pendingUser = null
+        unreadActivity = 0; pendingChat = null; chatUser = null; pendingUser = null
         api.token = null; me = null; posts.clear(); stories.clear(); forYou.clear(); followingPosts.clear(); ads.clear(); seenAds.clear(); viewedPosts.clear(); viewQueue.clear(); feedMode = 0; sharedPost = null; unreadMessages = 0
         prefs.edit().remove("token").apply()
     }
@@ -466,6 +468,7 @@ fun App(vm: AppVm = viewModel()) {
             }
         }
     }
+    vm.chatUser?.let { ChatScreen(vm, it) { vm.chatUser = null } }
     vm.sharedPost?.let { PostDetail(vm, it) { vm.sharedPost = null } }
     vm.pendingUser?.let { UserScreen(vm, it) { vm.pendingUser = null } }
 }
@@ -1331,7 +1334,6 @@ fun UserScreen(vm: AppVm, username: String, onClose: () -> Unit) {
     var followers by remember { mutableIntStateOf(0) }
     var following by remember { mutableIntStateOf(0) }
     var iFollow by remember { mutableStateOf(false) }
-    var chatOpen by remember { mutableStateOf(false) }
     var shareOpen by remember { mutableStateOf(false) }
     var listKind by remember { mutableStateOf<String?>(null) }
     LaunchedEffect(username) {
@@ -1378,7 +1380,7 @@ fun UserScreen(vm: AppVm, username: String, onClose: () -> Unit) {
                                 Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 4.dp), enabled = !vm.busy
                             ) { Text("Follow") }
                         Row(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 4.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                            OutlinedButton({ chatOpen = true }, Modifier.weight(1f)) { Text("Message") }
+                            OutlinedButton({ vm.chatUser = username; onClose() }, Modifier.weight(1f)) { Text("Message") }
                             OutlinedButton({ shareOpen = true }, Modifier.weight(1f)) { Text("Share profile") }
                         }
                     }
@@ -1396,7 +1398,6 @@ fun UserScreen(vm: AppVm, username: String, onClose: () -> Unit) {
             }
             openPost?.let { p -> PostDetail(vm, p, onDeleted = { posts.remove(p) }) { openPost = null } }
             listKind?.let { FollowListDialog(vm, username, it) { listKind = null } }
-            if (chatOpen) ChatScreen(vm, username) { chatOpen = false }
             if (shareOpen) SendDialog(vm, "Share profile", "$SERVER_URL/u/$username", "$username on Viora\n$SERVER_URL/u/$username") { shareOpen = false }
         }
     }
@@ -1406,11 +1407,10 @@ fun UserScreen(vm: AppVm, username: String, onClose: () -> Unit) {
 @Composable
 fun MessagesScreen(vm: AppVm) {
     var convos by remember { mutableStateOf<List<Convo>?>(null) }
-    var chatWith by remember { mutableStateOf<String?>(null) }
     var activityOpen by remember { mutableStateOf(false) }
-    LaunchedEffect(vm.pendingChat) { vm.pendingChat?.let { chatWith = it; vm.pendingChat = null } }
-    LaunchedEffect(chatWith) {
-        if (chatWith == null) {   // load on entry and when a chat closes, then keep the list fresh
+    LaunchedEffect(vm.pendingChat) { vm.pendingChat?.let { vm.chatUser = it; vm.pendingChat = null } }
+    LaunchedEffect(vm.chatUser) {
+        if (vm.chatUser == null) {   // load on entry and when a chat closes, then keep the list fresh
             while (true) {
                 try { convos = vm.api.conversations(); vm.refreshUnread() }
                 catch (e: CancellationException) { throw e }
@@ -1435,7 +1435,7 @@ fun MessagesScreen(vm: AppVm) {
             else -> LazyColumn {
                 items(list, key = { it.user }) { c ->
                     Row(
-                        Modifier.fillMaxWidth().clickable { chatWith = c.user }.padding(horizontal = 16.dp, vertical = 10.dp),
+                        Modifier.fillMaxWidth().clickable { vm.chatUser = c.user }.padding(horizontal = 16.dp, vertical = 10.dp),
                         verticalAlignment = Alignment.CenterVertically
                     ) {
                         Avatar(c.user, c.avatar, Modifier.size(48.dp))
@@ -1454,7 +1454,6 @@ fun MessagesScreen(vm: AppVm) {
             }
         }
     }
-    chatWith?.let { ChatScreen(vm, it) { chatWith = null } }
     if (activityOpen) ActivityDialog(vm) { activityOpen = false }
 }
 
@@ -1539,9 +1538,10 @@ fun ChatScreen(vm: AppVm, username: String, onClose: () -> Unit) {
     }
     LaunchedEffect(msgs.size) { if (msgs.isNotEmpty()) listState.scrollToItem(msgs.size - 1) }
     DisposableEffect(Unit) { onDispose { vm.refreshUnread() } }
-    Dialog(onDismissRequest = onClose, properties = DialogProperties(usePlatformDefaultWidth = false, decorFitsSystemWindows = false)) {
+    BackHandler(onBack = onClose)
+    run {
         Surface(Modifier.fillMaxSize()) {
-            Column(Modifier.fillMaxSize().safeDrawingPadding()) {   // keeps the text box above the keyboard and the navigation bar
+            Column(Modifier.fillMaxSize().safeDrawingPadding().imePadding()) {   // keeps the text box above the keyboard and the navigation bar
                 Row(Modifier.padding(horizontal = 8.dp), verticalAlignment = Alignment.CenterVertically) {
                     IconButton(onClose) { Icon(Icons.Filled.Close, "Close") }
                     Avatar(username, avatar, Modifier.size(36.dp))
