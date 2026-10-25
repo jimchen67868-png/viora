@@ -1407,6 +1407,7 @@ fun UserScreen(vm: AppVm, username: String, onClose: () -> Unit) {
 @Composable
 fun MessagesScreen(vm: AppVm) {
     var convos by remember { mutableStateOf<List<Convo>?>(null) }
+    var deleting by remember { mutableStateOf<String?>(null) }
     var activityOpen by remember { mutableStateOf(false) }
     LaunchedEffect(vm.pendingChat) { vm.pendingChat?.let { vm.chatUser = it; vm.pendingChat = null } }
     LaunchedEffect(vm.chatUser) {
@@ -1434,6 +1435,7 @@ fun MessagesScreen(vm: AppVm) {
             list.isEmpty() -> Text("No messages yet. Open someone's profile and tap Message to start a chat.", Modifier.padding(16.dp), color = Color.Gray)
             else -> LazyColumn {
                 items(list, key = { it.user }) { c ->
+                    var rowMenu by remember { mutableStateOf(false) }
                     Row(
                         Modifier.fillMaxWidth().clickable { vm.chatUser = c.user }.padding(horizontal = 16.dp, vertical = 10.dp),
                         verticalAlignment = Alignment.CenterVertically
@@ -1449,12 +1451,21 @@ fun MessagesScreen(vm: AppVm) {
                             if (c.created > 0) Text(timeAgo(c.created), fontSize = 11.sp, color = Color.Gray)
                             if (c.unread > 0) Badge { Text(c.unread.toString()) }
                         }
+                        Box {
+                            IconButton({ rowMenu = true }) { Icon(Icons.Filled.MoreVert, "More") }
+                            DropdownMenu(rowMenu, { rowMenu = false }) {
+                                DropdownMenuItem(text = { Text("Delete chat") }, onClick = { rowMenu = false; deleting = c.user })
+                            }
+                        }
                     }
                 }
             }
         }
     }
     if (activityOpen) ActivityDialog(vm) { activityOpen = false }
+    deleting?.let { name ->
+        DeleteChatDialog(vm, name, { deleting = null }) { convos = convos?.filter { it.user != name }; deleting = null }
+    }
 }
 
 @Composable
@@ -1515,12 +1526,39 @@ fun ActivityDialog(vm: AppVm, onClose: () -> Unit) {
 }
 
 @Composable
+fun DeleteChatDialog(vm: AppVm, username: String, onDismiss: () -> Unit, onDeleted: () -> Unit) {
+    val scope = rememberCoroutineScope()
+    var busy by remember { mutableStateOf(false) }
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("Delete chat?") },
+        text = { Text("This removes the conversation from your side only. $username keeps their copy, and the chat comes back if they message you again.") },
+        confirmButton = {
+            TextButton(
+                onClick = {
+                    busy = true
+                    scope.launch {
+                        try { vm.api.deleteChat(username); vm.refreshUnread(); onDeleted() }
+                        catch (e: CancellationException) { throw e }
+                        catch (e: Exception) { vm.toast(e.message); busy = false }
+                    }
+                },
+                enabled = !busy
+            ) { Text("Delete") }
+        },
+        dismissButton = { TextButton(onDismiss) { Text("Cancel") } }
+    )
+}
+
+@Composable
 fun ChatScreen(vm: AppVm, username: String, onClose: () -> Unit) {
     val msgs = remember { mutableStateListOf<Dm>() }
     var text by remember { mutableStateOf("") }
     var sending by remember { mutableStateOf(false) }
     var loaded by remember { mutableStateOf(false) }
     var avatar by remember { mutableStateOf<String?>(null) }
+    var menu by remember { mutableStateOf(false) }
+    var deleting by remember { mutableStateOf(false) }
     val listState = rememberLazyListState()
     val scope = rememberCoroutineScope()
     LaunchedEffect(username) {   // fetch new messages every few seconds while the chat is open
@@ -1542,12 +1580,19 @@ fun ChatScreen(vm: AppVm, username: String, onClose: () -> Unit) {
     run {
         Surface(Modifier.fillMaxSize()) {
             Column(Modifier.fillMaxSize().safeDrawingPadding().imePadding()) {   // keeps the text box above the keyboard and the navigation bar
-                Row(Modifier.padding(horizontal = 8.dp), verticalAlignment = Alignment.CenterVertically) {
+                Row(Modifier.fillMaxWidth().padding(horizontal = 8.dp), verticalAlignment = Alignment.CenterVertically) {
                     IconButton(onClose) { Icon(Icons.Filled.Close, "Close") }
                     Avatar(username, avatar, Modifier.size(36.dp))
                     Spacer(Modifier.width(10.dp))
-                    Text(username, fontWeight = FontWeight.Bold, fontSize = 18.sp)
+                    Text(username, Modifier.weight(1f), fontWeight = FontWeight.Bold, fontSize = 18.sp)
+                    Box {
+                        IconButton({ menu = true }) { Icon(Icons.Filled.MoreVert, "More") }
+                        DropdownMenu(menu, { menu = false }) {
+                            DropdownMenuItem(text = { Text("Delete chat") }, onClick = { menu = false; deleting = true })
+                        }
+                    }
                 }
+                if (deleting) DeleteChatDialog(vm, username, { deleting = false }) { deleting = false; onClose() }
                 HorizontalDivider()
                 LazyColumn(
                     Modifier.weight(1f).fillMaxWidth(), state = listState,

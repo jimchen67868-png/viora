@@ -42,6 +42,7 @@ SCHEMA = [
  "CREATE TABLE IF NOT EXISTS devices(token TEXT PRIMARY KEY, user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE, created DOUBLE PRECISION)",
  f"CREATE TABLE IF NOT EXISTS notifications(id {PK}, user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE, actor_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE, kind TEXT NOT NULL, post_id INTEGER REFERENCES posts(id) ON DELETE CASCADE, text TEXT, created DOUBLE PRECISION, seen INTEGER NOT NULL DEFAULT 0)",
  "CREATE INDEX IF NOT EXISTS notifications_user ON notifications(user_id, seen)",
+ "CREATE TABLE IF NOT EXISTS dm_cleared(user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE, other_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE, upto INTEGER NOT NULL, PRIMARY KEY(user_id, other_id))",
  "CREATE INDEX IF NOT EXISTS messages_recipient ON messages(recipient_id, sender_id, seen)",
  "CREATE INDEX IF NOT EXISTS messages_sender ON messages(sender_id, recipient_id)",
  f"CREATE TABLE IF NOT EXISTS stories(id {PK}, user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE, image TEXT NOT NULL, created DOUBLE PRECISION)",
@@ -1081,8 +1082,10 @@ def dm_inbox(h, q):
         me = h.user(c)["id"]
         rows = c.execute(
             "SELECT other, MAX(id) AS last_id, SUM(CASE WHEN recipient_id=? AND seen=0 THEN 1 ELSE 0 END) AS unread FROM "
-            "(SELECT id, recipient_id, seen, CASE WHEN sender_id=? THEN recipient_id ELSE sender_id END AS other "
-            "FROM messages WHERE sender_id=? OR recipient_id=?) t GROUP BY other ORDER BY last_id DESC LIMIT 100", (me, me, me, me)).fetchall()
+            "(SELECT m.id, m.recipient_id, m.seen, CASE WHEN m.sender_id=? THEN m.recipient_id ELSE m.sender_id END AS other "
+            "FROM messages m WHERE (m.sender_id=? OR m.recipient_id=?) AND m.id > COALESCE((SELECT d.upto FROM dm_cleared d WHERE d.user_id=? "
+            "AND d.other_id=(CASE WHEN m.sender_id=? THEN m.recipient_id ELSE m.sender_id END)), 0)) t "
+            "GROUP BY other ORDER BY last_id DESC LIMIT 100", (me, me, me, me, me, me)).fetchall()
         out = []
         for r in rows:
             m = c.execute("SELECT * FROM messages WHERE id=?", (r["last_id"],)).fetchone()
@@ -1098,11 +1101,25 @@ def dm_thread(h, q, name):
     except ValueError: after = 0
     with db() as c:
         me = h.user(c)["id"]; t = target_user(c, name)
+        cleared = c.execute("SELECT upto FROM dm_cleared WHERE user_id=? AND other_id=?", (me, t["id"])).fetchone()
+        floor = max(after, int(cleared["upto"]) if cleared else 0)   # messages you deleted stay hidden
         rows = c.execute("SELECT * FROM messages WHERE ((sender_id=? AND recipient_id=?) OR (sender_id=? AND recipient_id=?)) AND id>? "
-                         "ORDER BY id DESC LIMIT 100", (me, t["id"], t["id"], me, after)).fetchall()
+                         "ORDER BY id DESC LIMIT 100", (me, t["id"], t["id"], me, floor)).fetchall()
         c.execute("UPDATE messages SET seen=1 WHERE recipient_id=? AND sender_id=? AND seen=0", (me, t["id"]))
     h.send_json(200, {"messages": [dm_json(r, me) for r in reversed(rows)],
                       "user": {"username": t["username"], "avatar": h.url(t["avatar"])}})
+
+@route("DELETE", r"/api/messages/with/([A-Za-z0-9_.]{3,20})")
+def dm_delete(h, q, name):
+    """Deletes the chat on the caller's side only. The other person keeps theirs; new messages bring the chat back."""
+    with db() as c:
+        me = h.user(c)["id"]; t = target_user(c, name)
+        last = c.execute("SELECT COALESCE(MAX(id), 0) AS m FROM messages WHERE (sender_id=? AND recipient_id=?) OR (sender_id=? AND recipient_id=?)",
+                         (me, t["id"], t["id"], me)).fetchone()["m"]
+        c.execute("INSERT INTO dm_cleared(user_id,other_id,upto) VALUES(?,?,?) ON CONFLICT(user_id, other_id) DO UPDATE SET upto=excluded.upto",
+                  (me, t["id"], int(last)))
+        c.execute("UPDATE messages SET seen=1 WHERE recipient_id=? AND sender_id=?", (me, t["id"]))
+    h.send_json(200, {"ok": True})
 
 @route("POST", r"/api/messages/to/([A-Za-z0-9_.]{3,20})")
 def dm_send(h, q, name):
