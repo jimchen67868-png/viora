@@ -37,6 +37,7 @@ class Profile(
 class Plan(val id: String, val name: String, val price: String)
 class Convo(val user: String, val avatar: String?, val text: String, val mine: Boolean, val created: Long, val unread: Int)
 class Dm(val id: Int, val mine: Boolean, val text: String, val created: Long)
+class DmThread(val messages: List<Dm>, val avatar: String?)
 class ActivityItem(val id: Int, val kind: String, val user: String, val avatar: String?, val postId: Int?, val text: String, val created: Long, val isNew: Boolean)
 class BoostPlan(val days: Int, val price: String)
 class BoostInfo(val plans: List<BoostPlan>, val until: Long?, val active: Boolean, val views: Int)
@@ -157,9 +158,10 @@ class Api(var base: String, var token: String?) {
             Convo(o.getString("user"), o.str("avatar"), o.getString("text"), o.getBoolean("mine"), o.optLong("created", 0L), o.optInt("unread", 0))
         }
     }
-    suspend fun thread(name: String, after: Int): List<Dm> {
-        val a = send("GET", "/api/messages/with/" + enc(name) + "?after=$after").getJSONArray("messages")
-        return List(a.length()) { a.getJSONObject(it).toDm() }
+    suspend fun thread(name: String, after: Int): DmThread {
+        val j = send("GET", "/api/messages/with/" + enc(name) + "?after=$after")
+        val a = j.getJSONArray("messages")
+        return DmThread(List(a.length()) { a.getJSONObject(it).toDm() }, j.optJSONObject("user")?.str("avatar"))
     }
     suspend fun sendDm(name: String, text: String): Dm =
         send("POST", "/api/messages/to/" + enc(name), json("text" to text)).getJSONObject("message").toDm()

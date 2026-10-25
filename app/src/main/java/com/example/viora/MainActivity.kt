@@ -1378,12 +1378,15 @@ fun ChatScreen(vm: AppVm, username: String, onClose: () -> Unit) {
     var text by remember { mutableStateOf("") }
     var sending by remember { mutableStateOf(false) }
     var loaded by remember { mutableStateOf(false) }
+    var avatar by remember { mutableStateOf<String?>(null) }
     val listState = rememberLazyListState()
     val scope = rememberCoroutineScope()
     LaunchedEffect(username) {   // fetch new messages every few seconds while the chat is open
         while (true) {
             try {
-                val fresh = vm.api.thread(username, msgs.lastOrNull()?.id ?: 0)
+                val res = vm.api.thread(username, msgs.lastOrNull()?.id ?: 0)
+                val fresh = res.messages
+                avatar = res.avatar
                 if (fresh.isNotEmpty()) msgs.addAll(fresh.filter { n -> msgs.none { it.id == n.id } })
                 loaded = true
             } catch (e: CancellationException) { throw e }
@@ -1398,6 +1401,8 @@ fun ChatScreen(vm: AppVm, username: String, onClose: () -> Unit) {
             Column(Modifier.fillMaxSize().safeDrawingPadding()) {   // keeps the text box above the keyboard and the navigation bar
                 Row(Modifier.padding(horizontal = 8.dp), verticalAlignment = Alignment.CenterVertically) {
                     IconButton(onClose) { Icon(Icons.Filled.Close, "Close") }
+                    Avatar(username, avatar, Modifier.size(36.dp))
+                    Spacer(Modifier.width(10.dp))
                     Text(username, fontWeight = FontWeight.Bold, fontSize = 18.sp)
                 }
                 HorizontalDivider()
