@@ -585,6 +585,103 @@ fun Context.findActivity(): Activity? {
 
 class PlanRow(val label: String, val onClick: () -> Unit)
 
+/** A message that is just a link to a Viora post is shown as a post card. */
+private val postLink = Regex("^" + Regex.escape(SERVER_URL) + "/p/(\\d+)$")
+fun postLinkId(text: String): Int? = postLink.matchEntire(text.trim())?.groupValues?.get(1)?.toIntOrNull()
+
+@Composable
+fun ShareDialog(vm: AppVm, p: Post, onClose: () -> Unit) {
+    val ctx = LocalContext.current
+    val scope = rememberCoroutineScope()
+    var query by remember { mutableStateOf("") }
+    var found by remember { mutableStateOf<List<Profile>?>(null) }
+    var suggestions by remember { mutableStateOf<List<Profile>>(emptyList()) }
+    val sent = remember { mutableStateListOf<String>() }
+    var sending by remember { mutableStateOf<String?>(null) }
+    LaunchedEffect(Unit) {   // people you chat with first, then people you follow
+        try {
+            val chats = vm.api.conversations().map { Profile(it.user, "", it.avatar) }
+            val following = vm.me?.let { vm.api.followList(it.username, "following") } ?: emptyList()
+            suggestions = (chats + following).distinctBy { it.username }
+        } catch (e: CancellationException) { throw e }
+        catch (e: Exception) { }
+    }
+    LaunchedEffect(query) {
+        if (query.isBlank()) { found = null; return@LaunchedEffect }
+        delay(300)
+        try { found = vm.api.search(query.trim()).first.filter { it.username != vm.me?.username } }
+        catch (e: CancellationException) { throw e }
+        catch (e: Exception) { found = emptyList() }
+    }
+    val list = found ?: suggestions
+    AlertDialog(
+        onDismissRequest = onClose,
+        title = { Text("Share post") },
+        text = {
+            Column {
+                OutlinedButton({ sharePost(ctx, p); onClose() }, Modifier.fillMaxWidth()) { Text("Share outside Viora…") }
+                Text("Send in a message", fontWeight = FontWeight.Bold, modifier = Modifier.padding(top = 12.dp))
+                OutlinedTextField(
+                    query, { query = it }, Modifier.fillMaxWidth().padding(vertical = 4.dp),
+                    placeholder = { Text("Search people") }, singleLine = true
+                )
+                LazyColumn(Modifier.heightIn(max = 260.dp)) {
+                    if (list.isEmpty()) item {
+                        Text(if (query.isBlank()) "Follow people or start a chat to see them here." else "No one found.", color = Color.Gray, fontSize = 13.sp)
+                    }
+                    items(list, key = { it.username }) { u ->
+                        Row(Modifier.fillMaxWidth().padding(vertical = 4.dp), verticalAlignment = Alignment.CenterVertically) {
+                            Avatar(u.username, u.avatar, Modifier.size(40.dp))
+                            Spacer(Modifier.width(10.dp))
+                            Text(u.username, Modifier.weight(1f), maxLines = 1, overflow = TextOverflow.Ellipsis)
+                            val done = u.username in sent
+                            Button(
+                                onClick = {
+                                    sending = u.username
+                                    scope.launch {
+                                        try { vm.api.sendDm(u.username, "$SERVER_URL/p/${p.id}"); sent.add(u.username) }
+                                        catch (e: CancellationException) { throw e }
+                                        catch (e: Exception) { vm.toast(e.message) }
+                                        sending = null
+                                    }
+                                },
+                                enabled = !done && sending == null
+                            ) { Text(if (done) "Sent ✓" else "Send") }
+                        }
+                    }
+                }
+            }
+        },
+        confirmButton = { TextButton(onClose) { Text("Close") } }
+    )
+}
+
+@Composable
+fun SharedPostCard(vm: AppVm, id: Int) {
+    val state by produceState<Pair<Boolean, Post?>>(false to null, id) {
+        value = try { true to vm.api.post(id) }
+        catch (e: CancellationException) { throw e }
+        catch (e: Exception) { true to null }
+    }
+    val done = state.first
+    val post = state.second
+    Surface(
+        shape = RoundedCornerShape(12.dp), tonalElevation = 3.dp,
+        modifier = Modifier.width(240.dp).clickable(enabled = post != null) { post?.let { vm.sharedPost = it } }
+    ) {
+        Column {
+            if (post == null) Text(if (done) "This post is no longer available." else "Loading post…", Modifier.padding(12.dp), color = Color.Gray)
+            else {
+                AsyncImage(post.thumb ?: post.image, post.caption, contentScale = ContentScale.Crop, modifier = Modifier.fillMaxWidth().height(180.dp))
+                Column(Modifier.padding(10.dp)) {
+                    Text(post.user, fontWeight = FontWeight.Bold)
+                    if (post.caption.isNotBlank()) Text(post.caption, maxLines = 2, overflow = TextOverflow.Ellipsis, fontSize = 13.sp)
+                }
+            }
+        }
+    }
+}
+
 fun sharePost(ctx: Context, p: Post) {
     val text = buildString {
         append(p.user).append(" on Viora")
@@ -1015,6 +1112,7 @@ fun PostCard(
 ) {
     var menu by remember { mutableStateOf(false) }
     var boostOpen by remember { mutableStateOf(false) }
+    var shareOpen by remember { mutableStateOf(false) }
     LaunchedEffect(p.id) { vm.postSeen(p) }
     Column(Modifier.padding(bottom = 12.dp)) {
         Row(Modifier.padding(start = 10.dp, top = 4.dp, bottom = 4.dp), verticalAlignment = Alignment.CenterVertically) {
@@ -1055,8 +1153,7 @@ fun PostCard(
                 )
             }
             IconButton(onComments) { Icon(Icons.Outlined.ChatBubbleOutline, "Comments") }
-            val ctx = LocalContext.current
-            IconButton({ sharePost(ctx, p) }) { Icon(Icons.Filled.Share, "Share") }
+            IconButton({ shareOpen = true }) { Icon(Icons.Filled.Share, "Share") }
         }
         Text("${p.likes} likes", fontWeight = FontWeight.Bold, modifier = Modifier.padding(horizontal = 12.dp))
         if (p.caption.isNotBlank())
@@ -1078,6 +1175,7 @@ fun PostCard(
         ).joinToString("  ·  ")
         Text(meta, color = Color.Gray, fontSize = 11.sp, modifier = Modifier.padding(horizontal = 12.dp))
         if (boostOpen) BoostDialog(vm, p) { boostOpen = false }
+        if (shareOpen) ShareDialog(vm, p) { shareOpen = false }
     }
 }
 
@@ -1299,7 +1397,7 @@ fun MessagesScreen(vm: AppVm) {
                         Spacer(Modifier.width(12.dp))
                         Column(Modifier.weight(1f)) {
                             Text(c.user, fontWeight = if (c.unread > 0) FontWeight.Bold else FontWeight.Medium)
-                            Text((if (c.mine) "You: " else "") + c.text, maxLines = 1, overflow = TextOverflow.Ellipsis,
+                            Text((if (c.mine) "You: " else "") + (if (postLinkId(c.text) != null) "Shared a post" else c.text), maxLines = 1, overflow = TextOverflow.Ellipsis,
                                 color = Color.Gray, fontWeight = if (c.unread > 0) FontWeight.Bold else FontWeight.Normal)
                         }
                         Column(horizontalAlignment = Alignment.End) {
@@ -1414,7 +1512,8 @@ fun ChatScreen(vm: AppVm, username: String, onClose: () -> Unit) {
                     items(msgs, key = { it.id }) { m ->
                         Box(Modifier.fillMaxWidth(), contentAlignment = if (m.mine) Alignment.CenterEnd else Alignment.CenterStart) {
                             Column(Modifier.widthIn(max = 300.dp), horizontalAlignment = if (m.mine) Alignment.End else Alignment.Start) {
-                                Surface(
+                                val shared = postLinkId(m.text)
+                                if (shared != null) SharedPostCard(vm, shared) else Surface(
                                     shape = RoundedCornerShape(16.dp),
                                     color = if (m.mine) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.surfaceVariant
                                 ) {

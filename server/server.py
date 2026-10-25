@@ -1117,7 +1117,8 @@ def dm_send(h, q, name):
             raise HTTPError(429, "You're sending messages too fast. Wait a moment.")
         mid = c.execute("INSERT INTO messages(sender_id,recipient_id,text,created) VALUES(?,?,?,?) RETURNING id",
                         (u["id"], t["id"], text, now)).fetchone()["id"]
-    push_async(t["id"], u["username"], text[:120], {"viora_type": "message", "viora_user": u["username"]})
+    shared = re.fullmatch(r"https?://\S+/p/\d+", text) is not None   # a shared post link
+    push_async(t["id"], u["username"], "shared a post with you" if shared else text[:120], {"viora_type": "message", "viora_user": u["username"]})
     h.send_json(201, {"message": {"id": mid, "mine": True, "text": text, "created": int(now)}})
 
 @route("POST", r"/api/users/([A-Za-z0-9_.]{3,20})/follow")
