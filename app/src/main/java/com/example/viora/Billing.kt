@@ -19,7 +19,7 @@ import kotlin.coroutines.resume
 
 /** true: VIP is bought through Google Play Billing (required for apps distributed on Google Play).
  *  false: VIP is bought through Stripe in the browser (for APKs you share yourself). */
-const val USE_PLAY_BILLING = true
+const val USE_PLAY_BILLING = false
 
 /** Subscription product id created in Play Console (base plans inside it: "monthly", "yearly"). */
 const val PLAY_PRODUCT_ID = "viora_vip"
