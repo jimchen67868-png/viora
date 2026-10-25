@@ -1117,8 +1117,10 @@ def dm_send(h, q, name):
             raise HTTPError(429, "You're sending messages too fast. Wait a moment.")
         mid = c.execute("INSERT INTO messages(sender_id,recipient_id,text,created) VALUES(?,?,?,?) RETURNING id",
                         (u["id"], t["id"], text, now)).fetchone()["id"]
-    shared = re.fullmatch(r"https?://\S+/p/\d+", text) is not None   # a shared post link
-    push_async(t["id"], u["username"], "shared a post with you" if shared else text[:120], {"viora_type": "message", "viora_user": u["username"]})
+    if re.fullmatch(r"https?://\S+/p/\d+", text): body = "shared a post with you"
+    elif re.fullmatch(r"https?://\S+/u/[A-Za-z0-9_.]+", text): body = "shared a profile with you"
+    else: body = text[:120]
+    push_async(t["id"], u["username"], body, {"viora_type": "message", "viora_user": u["username"]})
     h.send_json(201, {"message": {"id": mid, "mine": True, "text": text, "created": int(now)}})
 
 @route("POST", r"/api/users/([A-Za-z0-9_.]{3,20})/follow")
@@ -1215,6 +1217,34 @@ SHARE_CSS = ("body{font-family:sans-serif;margin:0;background:#fafafa;color:#111
              ".b{display:block;margin:16px;padding:14px;text-align:center;background:#6200ee;color:#fff;"
              "text-decoration:none;border-radius:8px;font-weight:bold}"
              ".s{color:#777;font-size:13px;text-align:center;padding:0 16px 24px}")
+
+@route("GET", r"/u/([A-Za-z0-9_.]{3,20})")
+def user_page(h, q, name):
+    """Public landing page for a shared profile."""
+    esc = htmllib.escape
+    with db() as c:
+        t = c.execute("SELECT username, bio, avatar FROM users WHERE LOWER(username)=LOWER(?)", (name,)).fetchone()
+    if not t:
+        return h.send_html(404, "<!doctype html><meta name=viewport content='width=device-width,initial-scale=1'>"
+                                "<body style='font-family:sans-serif;text-align:center;padding:3rem 1rem'>"
+                                "<h2>User not found</h2><p>This account may no longer exist.</p>")
+    base = f"{h.headers.get('X-Forwarded-Proto', 'http')}://{h.headers.get('Host', 'localhost')}"
+    title, desc, pic = f"{t['username']} on Viora", (t["bio"] or "")[:200], h.url(t["avatar"])
+    head = ("<!doctype html><html><head><meta charset=utf-8>"
+            "<meta name=viewport content='width=device-width,initial-scale=1'>"
+            f"<title>{esc(title)}</title>"
+            f"<meta property=og:title content=\"{esc(title)}\">"
+            f"<meta property=og:description content=\"{esc(desc)}\">"
+            f"<meta property=og:url content=\"{esc(base)}/u/{esc(t['username'])}\">"
+            + (f"<meta property=og:image content=\"{esc(pic)}\">" if pic else "")
+            + f"<style>{SHARE_CSS}</style></head>")
+    avatar = (f"<img src=\"{esc(pic)}\" alt=\"\" style='width:120px;height:120px;border-radius:50%;object-fit:cover;margin:24px auto 8px'>" if pic else
+              f"<div style='width:120px;height:120px;border-radius:50%;background:#8134af;color:#fff;font-size:48px;line-height:120px;margin:24px auto 8px'>{esc(t['username'][:1].upper())}</div>")
+    body = (f"<body><div class=c style='text-align:center'>{avatar}<div class=h style='font-size:20px'>{esc(t['username'])}</div>"
+            + (f"<div class=t>{esc(t['bio'])}</div>" if t["bio"] else "")
+            + f"<a class=b href=\"viora://u/{esc(t['username'])}\">Open in Viora</a>"
+            "<div class=s>Install the Viora app to follow and message.</div></div></body></html>")
+    h.send_html(200, head + body)
 
 @route("GET", r"/p/(\d+)")
 def share_page(h, q, pid):

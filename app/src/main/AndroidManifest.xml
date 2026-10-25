@@ -16,12 +16,14 @@
                 <category android:name="android.intent.category.DEFAULT" />
                 <category android:name="android.intent.category.BROWSABLE" />
                 <data android:scheme="viora" android:host="p" />
+                <data android:scheme="viora" android:host="u" />
             </intent-filter>
             <intent-filter>
                 <action android:name="android.intent.action.VIEW" />
                 <category android:name="android.intent.category.DEFAULT" />
                 <category android:name="android.intent.category.BROWSABLE" />
                 <data android:scheme="https" android:host="viora-server.onrender.com" android:pathPrefix="/p/" />
+                <data android:scheme="https" android:host="viora-server.onrender.com" android:pathPrefix="/u/" />
             </intent-filter>
         </activity>
     </application>

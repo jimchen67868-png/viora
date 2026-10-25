@@ -411,7 +411,12 @@ class MainActivity : ComponentActivity() {
             "follow" -> i.getStringExtra("viora_user")?.let { vm.pendingUser = it }
             "like", "comment" -> i.getStringExtra("viora_post")?.toIntOrNull()?.let { vm.pendingPostId = it }
         }
-        val id = i.data?.lastPathSegment?.toIntOrNull() ?: return
+        val data = i.data ?: return
+        if ((data.scheme == "viora" && data.host == "u") || data.path?.startsWith("/u/") == true) {   // a shared profile
+            data.lastPathSegment?.let { vm.pendingUser = it }
+            return
+        }
+        val id = data.lastPathSegment?.toIntOrNull() ?: return
         vm.pendingPostId = id
     }
 
@@ -590,7 +595,12 @@ private val postLink = Regex("^" + Regex.escape(SERVER_URL) + "/p/(\\d+)$")
 fun postLinkId(text: String): Int? = postLink.matchEntire(text.trim())?.groupValues?.get(1)?.toIntOrNull()
 
 @Composable
-fun ShareDialog(vm: AppVm, p: Post, onClose: () -> Unit) {
+fun ShareDialog(vm: AppVm, p: Post, onClose: () -> Unit) =
+    SendDialog(vm, "Share post", "$SERVER_URL/p/${p.id}", postShareText(p), onClose)
+
+/** Pick people to send a link to in a direct message, or share it outside Viora. */
+@Composable
+fun SendDialog(vm: AppVm, title: String, link: String, outsideText: String, onClose: () -> Unit) {
     val ctx = LocalContext.current
     val scope = rememberCoroutineScope()
     var query by remember { mutableStateOf("") }
@@ -616,10 +626,10 @@ fun ShareDialog(vm: AppVm, p: Post, onClose: () -> Unit) {
     val list = found ?: suggestions
     AlertDialog(
         onDismissRequest = onClose,
-        title = { Text("Share post") },
+        title = { Text(title) },
         text = {
             Column {
-                OutlinedButton({ sharePost(ctx, p); onClose() }, Modifier.fillMaxWidth()) { Text("Share outside Viora…") }
+                OutlinedButton({ shareText(ctx, outsideText); onClose() }, Modifier.fillMaxWidth()) { Text("Share outside Viora…") }
                 Text("Send in a message", fontWeight = FontWeight.Bold, modifier = Modifier.padding(top = 12.dp))
                 OutlinedTextField(
                     query, { query = it }, Modifier.fillMaxWidth().padding(vertical = 4.dp),
@@ -639,7 +649,7 @@ fun ShareDialog(vm: AppVm, p: Post, onClose: () -> Unit) {
                                 onClick = {
                                     sending = u.username
                                     scope.launch {
-                                        try { vm.api.sendDm(u.username, "$SERVER_URL/p/${p.id}"); sent.add(u.username) }
+                                        try { vm.api.sendDm(u.username, link); sent.add(u.username) }
                                         catch (e: CancellationException) { throw e }
                                         catch (e: Exception) { vm.toast(e.message) }
                                         sending = null
@@ -654,6 +664,33 @@ fun ShareDialog(vm: AppVm, p: Post, onClose: () -> Unit) {
         },
         confirmButton = { TextButton(onClose) { Text("Close") } }
     )
+}
+
+private val userLink = Regex("^" + Regex.escape(SERVER_URL) + "/u/([A-Za-z0-9_.]{3,20})$")
+fun userLinkName(text: String): String? = userLink.matchEntire(text.trim())?.groupValues?.get(1)
+
+@Composable
+fun SharedUserCard(vm: AppVm, name: String) {
+    val profile by produceState<Profile?>(null, name) {
+        value = try { vm.api.user(name).first }
+        catch (e: CancellationException) { throw e }
+        catch (e: Exception) { null }
+    }
+    Surface(
+        shape = RoundedCornerShape(12.dp), tonalElevation = 3.dp,
+        modifier = Modifier.width(240.dp).clickable { vm.pendingUser = name }
+    ) {
+        Row(Modifier.padding(12.dp), verticalAlignment = Alignment.CenterVertically) {
+            Avatar(name, profile?.avatar, Modifier.size(52.dp))
+            Spacer(Modifier.width(12.dp))
+            Column {
+                Text(name, fontWeight = FontWeight.Bold)
+                val p = profile
+                if (p != null && p.bio.isNotBlank()) Text(p.bio, maxLines = 2, overflow = TextOverflow.Ellipsis, fontSize = 13.sp, color = Color.Gray)
+                else Text("Tap to view profile", fontSize = 13.sp, color = Color.Gray)
+            }
+        }
+    }
 }
 
 @Composable
@@ -682,15 +719,18 @@ fun SharedPostCard(vm: AppVm, id: Int) {
     }
 }
 
-fun sharePost(ctx: Context, p: Post) {
-    val text = buildString {
-        append(p.user).append(" on Viora")
-        if (p.caption.isNotBlank()) append(": ").append(p.caption)
-        append("\n").append("$SERVER_URL/p/${p.id}")
-    }
-    val send = Intent(Intent.ACTION_SEND).apply { type = "text/plain"; putExtra(Intent.EXTRA_TEXT, text) }
-    ctx.startActivity(Intent.createChooser(send, "Share post"))
+fun postShareText(p: Post): String = buildString {
+    append(p.user).append(" on Viora")
+    if (p.caption.isNotBlank()) append(": ").append(p.caption)
+    append("\n").append("$SERVER_URL/p/${p.id}")
 }
+
+fun shareText(ctx: Context, text: String) {
+    val send = Intent(Intent.ACTION_SEND).apply { type = "text/plain"; putExtra(Intent.EXTRA_TEXT, text) }
+    ctx.startActivity(Intent.createChooser(send, "Share"))
+}
+
+fun sharePost(ctx: Context, p: Post) = shareText(ctx, postShareText(p))
 
 fun timeAgo(epochSeconds: Long): String {
     if (epochSeconds <= 0) return ""
@@ -1292,6 +1332,7 @@ fun UserScreen(vm: AppVm, username: String, onClose: () -> Unit) {
     var following by remember { mutableIntStateOf(0) }
     var iFollow by remember { mutableStateOf(false) }
     var chatOpen by remember { mutableStateOf(false) }
+    var shareOpen by remember { mutableStateOf(false) }
     var listKind by remember { mutableStateOf<String?>(null) }
     LaunchedEffect(username) {
         try {
@@ -1336,7 +1377,10 @@ fun UserScreen(vm: AppVm, username: String, onClose: () -> Unit) {
                                 { vm.follow(p.username, true) { n -> iFollow = true; followers = n } },
                                 Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 4.dp), enabled = !vm.busy
                             ) { Text("Follow") }
-                        OutlinedButton({ chatOpen = true }, Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 4.dp)) { Text("Message") }
+                        Row(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 4.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            OutlinedButton({ chatOpen = true }, Modifier.weight(1f)) { Text("Message") }
+                            OutlinedButton({ shareOpen = true }, Modifier.weight(1f)) { Text("Share profile") }
+                        }
                     }
                     HorizontalDivider()
                     if (posts.isEmpty()) Text("No posts yet.", Modifier.padding(16.dp), color = Color.Gray)
@@ -1353,6 +1397,7 @@ fun UserScreen(vm: AppVm, username: String, onClose: () -> Unit) {
             openPost?.let { p -> PostDetail(vm, p, onDeleted = { posts.remove(p) }) { openPost = null } }
             listKind?.let { FollowListDialog(vm, username, it) { listKind = null } }
             if (chatOpen) ChatScreen(vm, username) { chatOpen = false }
+            if (shareOpen) SendDialog(vm, "Share profile", "$SERVER_URL/u/$username", "$username on Viora\n$SERVER_URL/u/$username") { shareOpen = false }
         }
     }
 }
@@ -1397,7 +1442,7 @@ fun MessagesScreen(vm: AppVm) {
                         Spacer(Modifier.width(12.dp))
                         Column(Modifier.weight(1f)) {
                             Text(c.user, fontWeight = if (c.unread > 0) FontWeight.Bold else FontWeight.Medium)
-                            Text((if (c.mine) "You: " else "") + (if (postLinkId(c.text) != null) "Shared a post" else c.text), maxLines = 1, overflow = TextOverflow.Ellipsis,
+                            Text((if (c.mine) "You: " else "") + (if (postLinkId(c.text) != null) "Shared a post" else if (userLinkName(c.text) != null) "Shared a profile" else c.text), maxLines = 1, overflow = TextOverflow.Ellipsis,
                                 color = Color.Gray, fontWeight = if (c.unread > 0) FontWeight.Bold else FontWeight.Normal)
                         }
                         Column(horizontalAlignment = Alignment.End) {
@@ -1513,7 +1558,10 @@ fun ChatScreen(vm: AppVm, username: String, onClose: () -> Unit) {
                         Box(Modifier.fillMaxWidth(), contentAlignment = if (m.mine) Alignment.CenterEnd else Alignment.CenterStart) {
                             Column(Modifier.widthIn(max = 300.dp), horizontalAlignment = if (m.mine) Alignment.End else Alignment.Start) {
                                 val shared = postLinkId(m.text)
-                                if (shared != null) SharedPostCard(vm, shared) else Surface(
+                                val sharedUser = userLinkName(m.text)
+                                if (shared != null) SharedPostCard(vm, shared)
+                                else if (sharedUser != null) SharedUserCard(vm, sharedUser)
+                                else Surface(
                                     shape = RoundedCornerShape(16.dp),
                                     color = if (m.mine) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.surfaceVariant
                                 ) {
