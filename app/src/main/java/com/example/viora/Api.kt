@@ -35,6 +35,9 @@ class Profile(
     val followingPrivacy: String = "everyone"
 )
 class Plan(val id: String, val name: String, val price: String)
+class Convo(val user: String, val avatar: String?, val text: String, val mine: Boolean, val created: Long, val unread: Int)
+class Dm(val id: Int, val mine: Boolean, val text: String, val created: Long)
+class ActivityItem(val id: Int, val kind: String, val user: String, val avatar: String?, val postId: Int?, val text: String, val created: Long, val isNew: Boolean)
 class BoostPlan(val days: Int, val price: String)
 class BoostInfo(val plans: List<BoostPlan>, val until: Long?, val active: Boolean, val views: Int)
 class Comment(val user: String, val avatar: String?, val text: String, val created: Long = 0)
@@ -75,6 +78,7 @@ private fun JSONObject.toProfile() =
         str("account_id"),
         followers = optInt("followers", 0), following = optInt("following", 0), isFollowing = optBoolean("is_following", false),
         followingPrivacy = optString("following_privacy", "everyone"))
+private fun JSONObject.toDm() = Dm(getInt("id"), getBoolean("mine"), getString("text"), optLong("created", 0L))
 private fun JSONObject.toComment() = Comment(getString("user"), str("avatar"), getString("text"), optLong("created", 0L))
 private fun JSONObject.toPost() = Post(
     getInt("id"), getString("user"), str("avatar"), getString("image"),
@@ -146,6 +150,34 @@ class Api(var base: String, var token: String?) {
     }
     suspend fun boostCheckout(postId: Int, days: Int) =
         send("POST", "/api/boost/checkout", json("post_id" to postId.toString(), "days" to days.toString())).getString("url")
+    suspend fun conversations(): List<Convo> {
+        val a = send("GET", "/api/messages").getJSONArray("conversations")
+        return List(a.length()) {
+            val o = a.getJSONObject(it)
+            Convo(o.getString("user"), o.str("avatar"), o.getString("text"), o.getBoolean("mine"), o.optLong("created", 0L), o.optInt("unread", 0))
+        }
+    }
+    suspend fun thread(name: String, after: Int): List<Dm> {
+        val a = send("GET", "/api/messages/with/" + enc(name) + "?after=$after").getJSONArray("messages")
+        return List(a.length()) { a.getJSONObject(it).toDm() }
+    }
+    suspend fun sendDm(name: String, text: String): Dm =
+        send("POST", "/api/messages/to/" + enc(name), json("text" to text)).getJSONObject("message").toDm()
+    /** (unread messages, unread activity) */
+    suspend fun unreadCounts(): Pair<Int, Int> {
+        val j = send("GET", "/api/messages/unread")
+        return j.getInt("count") to j.optInt("activity", 0)
+    }
+    suspend fun activity(): List<ActivityItem> {
+        val a = send("GET", "/api/notifications").getJSONArray("notifications")
+        return List(a.length()) {
+            val o = a.getJSONObject(it)
+            ActivityItem(o.getInt("id"), o.getString("kind"), o.getString("user"), o.str("avatar"),
+                if (o.isNull("post_id")) null else o.getInt("post_id"), o.optString("text", ""), o.optLong("created", 0L), o.optBoolean("new", false))
+        }
+    }
+    suspend fun registerDevice(token: String) { send("POST", "/api/devices", json("token" to token)) }
+    suspend fun removeDevice(token: String) { send("POST", "/api/devices/remove", json("token" to token)) }
     suspend fun following(): List<Post> {
         val a = send("GET", "/api/feed/following").getJSONArray("posts")
         return List(a.length()) { a.getJSONObject(it).toPost() }

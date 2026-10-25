@@ -1,6 +1,12 @@
 package com.example.viora
 
+import android.Manifest
 import android.app.Application
+import android.app.NotificationChannel
+import android.app.NotificationManager
+import android.content.pm.PackageManager
+import android.os.Build
+import androidx.core.content.ContextCompat
 import android.app.Activity
 import android.content.Context
 import android.content.Intent
@@ -28,6 +34,7 @@ import androidx.compose.foundation.gestures.detectTransformGestures
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyRow
+import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.lazy.grid.GridCells
 import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
 import androidx.compose.foundation.lazy.grid.items
@@ -40,6 +47,8 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.AddBox
 import androidx.compose.material.icons.filled.Close
+import androidx.compose.material.icons.filled.Email
+import androidx.compose.material.icons.filled.Notifications
 import androidx.compose.material.icons.filled.Favorite
 import androidx.compose.material.icons.filled.FavoriteBorder
 import androidx.compose.material.icons.filled.Home
@@ -70,6 +79,7 @@ import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
 import androidx.lifecycle.AndroidViewModel
@@ -137,6 +147,34 @@ class AppVm(app: Application) : AndroidViewModel(app) {
     }
     var pendingPostId by mutableStateOf<Int?>(null)
     var sharedPost by mutableStateOf<Post?>(null)
+    var unreadMessages by mutableIntStateOf(0)
+    var unreadActivity by mutableIntStateOf(0)
+    var pendingChat by mutableStateOf<String?>(null)
+    var pendingUser by mutableStateOf<String?>(null)
+
+    /** Registers this phone for push notifications. Does nothing in builds without google-services.json. */
+    fun registerPush() {
+        try {
+            com.google.firebase.messaging.FirebaseMessaging.getInstance().token.addOnSuccessListener { tok ->
+                if (!tok.isNullOrBlank()) viewModelScope.launch {
+                    try { api.registerDevice(tok); prefs.edit().putString("push_token", tok).apply() }
+                    catch (e: CancellationException) { throw e }
+                    catch (e: Exception) { }
+                }
+            }
+        } catch (e: Exception) { /* Firebase isn't set up in this build */ }
+    }
+
+    fun refreshUnread() {
+        viewModelScope.launch {
+            try {
+                val (m, a) = api.unreadCounts(); unreadMessages = m; unreadActivity = a
+                prefs.edit().putInt("notified_total", m + a).apply()   // what you've already seen: the background check only alerts about more than this
+            }
+            catch (e: CancellationException) { throw e }
+            catch (e: Exception) { }
+        }
+    }
     val play = PlayBilling(app, { list -> onPlayPurchases(list) }, { msg -> toast(msg) })
     var forYouPersonal by mutableStateOf(true)
     var feedMode by mutableIntStateOf(0)
@@ -197,7 +235,15 @@ class AppVm(app: Application) : AndroidViewModel(app) {
     }
 
     fun logout() {
-        api.token = null; me = null; posts.clear(); stories.clear(); forYou.clear(); followingPosts.clear(); ads.clear(); seenAds.clear(); viewedPosts.clear(); viewQueue.clear(); feedMode = 0; sharedPost = null
+        val oldToken = api.token; val pushToken = prefs.getString("push_token", null)
+        if (oldToken != null && pushToken != null) viewModelScope.launch {   // stop pushes for this account on this phone
+            try { Api(SERVER_URL, oldToken).removeDevice(pushToken) }
+            catch (e: CancellationException) { throw e }
+            catch (e: Exception) { }
+        }
+        prefs.edit().remove("push_token").remove("notified_total").apply()
+        unreadActivity = 0; pendingChat = null; pendingUser = null
+        api.token = null; me = null; posts.clear(); stories.clear(); forYou.clear(); followingPosts.clear(); ads.clear(); seenAds.clear(); viewedPosts.clear(); viewQueue.clear(); feedMode = 0; sharedPost = null; unreadMessages = 0
         prefs.edit().remove("token").apply()
     }
 
@@ -340,9 +386,16 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
+        if (Build.VERSION.SDK_INT >= 26)
+            getSystemService(NotificationManager::class.java).createNotificationChannel(
+                NotificationChannel("viora_activity", "Messages and activity", NotificationManager.IMPORTANCE_DEFAULT))
         setContent { MaterialTheme { Surface { App() } } }
+        scheduleNotifyWorker(applicationContext)
         if (savedInstanceState == null) handleLink(intent)
     }
+
+    override fun onStart() { super.onStart(); AppState.foreground = true }
+    override fun onStop() { super.onStop(); AppState.foreground = false }
 
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
@@ -351,7 +404,14 @@ class MainActivity : ComponentActivity() {
 
     /** viora://p/123 or https://<server>/p/123 -> remember post 123 and open it. */
     private fun handleLink(i: Intent?) {
-        val id = i?.data?.lastPathSegment?.toIntOrNull() ?: return
+        if (i == null) return
+        // tapped a push notification
+        when (i.getStringExtra("viora_type")) {
+            "message" -> i.getStringExtra("viora_user")?.let { vm.pendingChat = it }
+            "follow" -> i.getStringExtra("viora_user")?.let { vm.pendingUser = it }
+            "like", "comment" -> i.getStringExtra("viora_post")?.toIntOrNull()?.let { vm.pendingPostId = it }
+        }
+        val id = i.data?.lastPathSegment?.toIntOrNull() ?: return
         vm.pendingPostId = id
     }
 
@@ -367,12 +427,28 @@ fun App(vm: AppVm = viewModel()) {
     if (vm.me == null) { Login(vm); return }
     var tab by remember { mutableIntStateOf(0) }
     LaunchedEffect(vm.pendingPostId) { if (vm.pendingPostId != null) vm.openPendingPost() }
+    LaunchedEffect(vm.me?.username) { while (true) { vm.refreshUnread(); delay(30_000) } }
+    LaunchedEffect(vm.pendingChat) { if (vm.pendingChat != null) tab = 3 }
+    val ctx = LocalContext.current
+    val notifPermission = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { vm.registerPush() }
+    LaunchedEffect(vm.me?.username) {   // ask once after login (Android 13+), then register this phone for pushes
+        if (Build.VERSION.SDK_INT >= 33 &&
+            ContextCompat.checkSelfPermission(ctx, Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED)
+            notifPermission.launch(Manifest.permission.POST_NOTIFICATIONS)
+        else vm.registerPush()
+    }
     Scaffold(bottomBar = {
         NavigationBar {
             NavigationBarItem(tab == 0, { tab = 0 }, { Icon(Icons.Filled.Home, "Home") })
             NavigationBarItem(tab == 1, { tab = 1 }, { Icon(Icons.Filled.Search, "Search") })
             NavigationBarItem(tab == 2, { tab = 2 }, { Icon(Icons.Filled.AddBox, "New post") })
-            NavigationBarItem(tab == 3, { tab = 3 }, { Icon(Icons.Filled.Person, "Profile") })
+            NavigationBarItem(tab == 3, { tab = 3 }, {
+                val unread = vm.unreadMessages + vm.unreadActivity
+                BadgedBox(badge = {
+                    if (unread > 0) Badge { Text(if (unread > 9) "9+" else unread.toString()) }
+                }) { Icon(Icons.Filled.Email, "Messages") }
+            })
+            NavigationBarItem(tab == 4, { tab = 4 }, { Icon(Icons.Filled.Person, "Profile") })
         }
     }) { pad ->
         Box(Modifier.padding(pad)) {
@@ -380,11 +456,13 @@ fun App(vm: AppVm = viewModel()) {
                 0 -> Feed(vm)
                 1 -> SearchScreen(vm)
                 2 -> NewPost(vm) { tab = 0 }
+                3 -> MessagesScreen(vm)
                 else -> ProfileScreen(vm)
             }
         }
     }
     vm.sharedPost?.let { PostDetail(vm, it) { vm.sharedPost = null } }
+    vm.pendingUser?.let { UserScreen(vm, it) { vm.pendingUser = null } }
 }
 
 // ---------- Login ----------
@@ -1115,6 +1193,7 @@ fun UserScreen(vm: AppVm, username: String, onClose: () -> Unit) {
     var followers by remember { mutableIntStateOf(0) }
     var following by remember { mutableIntStateOf(0) }
     var iFollow by remember { mutableStateOf(false) }
+    var chatOpen by remember { mutableStateOf(false) }
     var listKind by remember { mutableStateOf<String?>(null) }
     LaunchedEffect(username) {
         try {
@@ -1159,6 +1238,7 @@ fun UserScreen(vm: AppVm, username: String, onClose: () -> Unit) {
                                 { vm.follow(p.username, true) { n -> iFollow = true; followers = n } },
                                 Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 4.dp), enabled = !vm.busy
                             ) { Text("Follow") }
+                        OutlinedButton({ chatOpen = true }, Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 4.dp)) { Text("Message") }
                     }
                     HorizontalDivider()
                     if (posts.isEmpty()) Text("No posts yet.", Modifier.padding(16.dp), color = Color.Gray)
@@ -1174,6 +1254,198 @@ fun UserScreen(vm: AppVm, username: String, onClose: () -> Unit) {
             }
             openPost?.let { p -> PostDetail(vm, p, onDeleted = { posts.remove(p) }) { openPost = null } }
             listKind?.let { FollowListDialog(vm, username, it) { listKind = null } }
+            if (chatOpen) ChatScreen(vm, username) { chatOpen = false }
+        }
+    }
+}
+
+// ---------- Messages ----------
+@Composable
+fun MessagesScreen(vm: AppVm) {
+    var convos by remember { mutableStateOf<List<Convo>?>(null) }
+    var chatWith by remember { mutableStateOf<String?>(null) }
+    var activityOpen by remember { mutableStateOf(false) }
+    LaunchedEffect(vm.pendingChat) { vm.pendingChat?.let { chatWith = it; vm.pendingChat = null } }
+    LaunchedEffect(chatWith) {
+        if (chatWith == null) {   // load on entry and when a chat closes, then keep the list fresh
+            while (true) {
+                try { convos = vm.api.conversations(); vm.refreshUnread() }
+                catch (e: CancellationException) { throw e }
+                catch (e: Exception) { if (convos == null) convos = emptyList() }
+                delay(10_000)
+            }
+        }
+    }
+    Column(Modifier.fillMaxSize()) {
+        Row(Modifier.fillMaxWidth().padding(start = 16.dp, end = 8.dp, top = 8.dp), verticalAlignment = Alignment.CenterVertically) {
+            Text("Messages", fontSize = 20.sp, fontWeight = FontWeight.Bold, modifier = Modifier.weight(1f))
+            IconButton({ activityOpen = true }) {
+                BadgedBox(badge = { if (vm.unreadActivity > 0) Badge { Text(if (vm.unreadActivity > 9) "9+" else vm.unreadActivity.toString()) } }) {
+                    Icon(Icons.Filled.Notifications, "Activity")
+                }
+            }
+        }
+        val list = convos
+        when {
+            list == null -> Text("Loading…", Modifier.padding(16.dp), color = Color.Gray)
+            list.isEmpty() -> Text("No messages yet. Open someone's profile and tap Message to start a chat.", Modifier.padding(16.dp), color = Color.Gray)
+            else -> LazyColumn {
+                items(list, key = { it.user }) { c ->
+                    Row(
+                        Modifier.fillMaxWidth().clickable { chatWith = c.user }.padding(horizontal = 16.dp, vertical = 10.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Avatar(c.user, c.avatar, Modifier.size(48.dp))
+                        Spacer(Modifier.width(12.dp))
+                        Column(Modifier.weight(1f)) {
+                            Text(c.user, fontWeight = if (c.unread > 0) FontWeight.Bold else FontWeight.Medium)
+                            Text((if (c.mine) "You: " else "") + c.text, maxLines = 1, overflow = TextOverflow.Ellipsis,
+                                color = Color.Gray, fontWeight = if (c.unread > 0) FontWeight.Bold else FontWeight.Normal)
+                        }
+                        Column(horizontalAlignment = Alignment.End) {
+                            if (c.created > 0) Text(timeAgo(c.created), fontSize = 11.sp, color = Color.Gray)
+                            if (c.unread > 0) Badge { Text(c.unread.toString()) }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    chatWith?.let { ChatScreen(vm, it) { chatWith = null } }
+    if (activityOpen) ActivityDialog(vm) { activityOpen = false }
+}
+
+@Composable
+fun ActivityDialog(vm: AppVm, onClose: () -> Unit) {
+    var acts by remember { mutableStateOf<List<ActivityItem>?>(null) }
+    var userView by remember { mutableStateOf<String?>(null) }
+    var openPost by remember { mutableStateOf<Post?>(null) }
+    val scope = rememberCoroutineScope()
+    LaunchedEffect(Unit) {
+        try { acts = vm.api.activity(); vm.refreshUnread() }
+        catch (e: CancellationException) { throw e }
+        catch (e: Exception) { vm.toast(e.message); acts = emptyList() }
+    }
+    Dialog(onDismissRequest = onClose, properties = DialogProperties(usePlatformDefaultWidth = false)) {
+        Surface(Modifier.fillMaxSize()) {
+            Column(Modifier.padding(top = 24.dp)) {
+                Row(Modifier.padding(horizontal = 8.dp), verticalAlignment = Alignment.CenterVertically) {
+                    IconButton(onClose) { Icon(Icons.Filled.Close, "Close") }
+                    Text("Activity", fontWeight = FontWeight.Bold, fontSize = 18.sp)
+                }
+                HorizontalDivider()
+                val list = acts
+                when {
+                    list == null -> Text("Loading…", Modifier.padding(16.dp), color = Color.Gray)
+                    list.isEmpty() -> Text("Nothing yet. Likes, comments and new followers show up here.", Modifier.padding(16.dp), color = Color.Gray)
+                    else -> LazyColumn {
+                        items(list, key = { it.id }) { a ->
+                            Row(
+                                Modifier.fillMaxWidth()
+                                    .background(if (a.isNew) Color(0x1A8134AF) else Color.Transparent)
+                                    .clickable {
+                                        val pid = a.postId
+                                        if (pid == null) userView = a.user
+                                        else scope.launch {
+                                            try { openPost = vm.api.post(pid) }
+                                            catch (e: CancellationException) { throw e }
+                                            catch (e: Exception) { vm.toast(e.message) }
+                                        }
+                                    }
+                                    .padding(horizontal = 16.dp, vertical = 10.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Avatar(a.user, a.avatar, Modifier.size(44.dp))
+                                Spacer(Modifier.width(12.dp))
+                                Column(Modifier.weight(1f)) {
+                                    Text(buildAnnotatedString { withStyle(SpanStyle(fontWeight = FontWeight.Bold)) { append(a.user) }; append(" " + a.text) })
+                                    if (a.created > 0) Text(timeAgo(a.created), fontSize = 11.sp, color = Color.Gray)
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            userView?.let { UserScreen(vm, it) { userView = null } }
+            openPost?.let { PostDetail(vm, it) { openPost = null } }
+        }
+    }
+}
+
+@Composable
+fun ChatScreen(vm: AppVm, username: String, onClose: () -> Unit) {
+    val msgs = remember { mutableStateListOf<Dm>() }
+    var text by remember { mutableStateOf("") }
+    var sending by remember { mutableStateOf(false) }
+    var loaded by remember { mutableStateOf(false) }
+    val listState = rememberLazyListState()
+    val scope = rememberCoroutineScope()
+    LaunchedEffect(username) {   // fetch new messages every few seconds while the chat is open
+        while (true) {
+            try {
+                val fresh = vm.api.thread(username, msgs.lastOrNull()?.id ?: 0)
+                if (fresh.isNotEmpty()) msgs.addAll(fresh.filter { n -> msgs.none { it.id == n.id } })
+                loaded = true
+            } catch (e: CancellationException) { throw e }
+            catch (e: Exception) { if (!loaded) { vm.toast(e.message); loaded = true } }
+            delay(3000)
+        }
+    }
+    LaunchedEffect(msgs.size) { if (msgs.isNotEmpty()) listState.scrollToItem(msgs.size - 1) }
+    DisposableEffect(Unit) { onDispose { vm.refreshUnread() } }
+    Dialog(onDismissRequest = onClose, properties = DialogProperties(usePlatformDefaultWidth = false)) {
+        Surface(Modifier.fillMaxSize()) {
+            Column(Modifier.fillMaxSize().padding(top = 24.dp).imePadding()) {
+                Row(Modifier.padding(horizontal = 8.dp), verticalAlignment = Alignment.CenterVertically) {
+                    IconButton(onClose) { Icon(Icons.Filled.Close, "Close") }
+                    Text(username, fontWeight = FontWeight.Bold, fontSize = 18.sp)
+                }
+                HorizontalDivider()
+                LazyColumn(
+                    Modifier.weight(1f).fillMaxWidth(), state = listState,
+                    contentPadding = PaddingValues(12.dp), verticalArrangement = Arrangement.spacedBy(6.dp)
+                ) {
+                    if (loaded && msgs.isEmpty()) item { Text("Say hi to $username 👋", color = Color.Gray) }
+                    items(msgs, key = { it.id }) { m ->
+                        Box(Modifier.fillMaxWidth(), contentAlignment = if (m.mine) Alignment.CenterEnd else Alignment.CenterStart) {
+                            Column(Modifier.widthIn(max = 300.dp), horizontalAlignment = if (m.mine) Alignment.End else Alignment.Start) {
+                                Surface(
+                                    shape = RoundedCornerShape(16.dp),
+                                    color = if (m.mine) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.surfaceVariant
+                                ) {
+                                    Text(
+                                        m.text, Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
+                                        color = if (m.mine) MaterialTheme.colorScheme.onPrimary else MaterialTheme.colorScheme.onSurfaceVariant
+                                    )
+                                }
+                                if (m.created > 0) Text(timeAgo(m.created), fontSize = 10.sp, color = Color.Gray)
+                            }
+                        }
+                    }
+                }
+                Row(Modifier.fillMaxWidth().padding(8.dp), verticalAlignment = Alignment.CenterVertically) {
+                    OutlinedTextField(
+                        text, { if (it.length <= 1000) text = it }, Modifier.weight(1f),
+                        placeholder = { Text("Message…") }, maxLines = 4
+                    )
+                    IconButton(
+                        onClick = {
+                            val t = text.trim()
+                            sending = true
+                            scope.launch {
+                                try {
+                                    val m = vm.api.sendDm(username, t)
+                                    if (msgs.none { it.id == m.id }) msgs.add(m)
+                                    text = ""
+                                } catch (e: CancellationException) { throw e }
+                                catch (e: Exception) { vm.toast(e.message) }
+                                sending = false
+                            }
+                        },
+                        enabled = text.isNotBlank() && !sending
+                    ) { Icon(Icons.Filled.Send, "Send") }
+                }
+            }
         }
     }
 }

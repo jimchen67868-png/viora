@@ -4,7 +4,7 @@ Run:  python3 server.py   (env: PORT=8000, DATABASE_URL=postgres://... or VIORA_
 """
 import html as htmllib
 import random
-import base64, datetime, hashlib, hmac, io, json, math, os, re, secrets, shutil, sqlite3, subprocess, tempfile, time, traceback, urllib.error, urllib.parse, urllib.request
+import base64, datetime, hashlib, hmac, io, json, math, os, re, secrets, shutil, sqlite3, subprocess, tempfile, threading, time, traceback, urllib.error, urllib.parse, urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
@@ -38,6 +38,12 @@ SCHEMA = [
  "CREATE TABLE IF NOT EXISTS follows(follower_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE, followee_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE, created DOUBLE PRECISION, PRIMARY KEY(follower_id, followee_id))",
  "CREATE TABLE IF NOT EXISTS post_views(post_id INTEGER NOT NULL REFERENCES posts(id) ON DELETE CASCADE, user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE, created DOUBLE PRECISION, PRIMARY KEY(post_id, user_id))",
  f"CREATE TABLE IF NOT EXISTS boosts(id {PK}, post_id INTEGER NOT NULL REFERENCES posts(id) ON DELETE CASCADE, user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE, days INTEGER NOT NULL, ends DOUBLE PRECISION NOT NULL, created DOUBLE PRECISION, session_id TEXT, views INTEGER NOT NULL DEFAULT 0)",
+ f"CREATE TABLE IF NOT EXISTS messages(id {PK}, sender_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE, recipient_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE, text TEXT NOT NULL, created DOUBLE PRECISION, seen INTEGER NOT NULL DEFAULT 0)",
+ "CREATE TABLE IF NOT EXISTS devices(token TEXT PRIMARY KEY, user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE, created DOUBLE PRECISION)",
+ f"CREATE TABLE IF NOT EXISTS notifications(id {PK}, user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE, actor_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE, kind TEXT NOT NULL, post_id INTEGER REFERENCES posts(id) ON DELETE CASCADE, text TEXT, created DOUBLE PRECISION, seen INTEGER NOT NULL DEFAULT 0)",
+ "CREATE INDEX IF NOT EXISTS notifications_user ON notifications(user_id, seen)",
+ "CREATE INDEX IF NOT EXISTS messages_recipient ON messages(recipient_id, sender_id, seen)",
+ "CREATE INDEX IF NOT EXISTS messages_sender ON messages(sender_id, recipient_id)",
  f"CREATE TABLE IF NOT EXISTS stories(id {PK}, user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE, image TEXT NOT NULL, created DOUBLE PRECISION)",
 ]
 INTEGRITY = (sqlite3.IntegrityError, psycopg2.IntegrityError) if PG else (sqlite3.IntegrityError,)
@@ -933,12 +939,194 @@ def target_user(c, name):
 def follower_count(c, uid):
     return c.execute("SELECT COUNT(*) AS n FROM follows WHERE followee_id=?", (uid,)).fetchone()["n"]
 
+# ---------- Push notifications (Firebase Cloud Messaging, HTTP v1) ----------
+# Needs env FIREBASE_SERVICE_ACCOUNT = the whole service-account JSON from Firebase. Without it, pushes are skipped (the in-app Activity list still works).
+def _der(buf, i):
+    """Reads one DER element at i; returns (tag, content_start, content_end)."""
+    tag, ln = buf[i], buf[i + 1]; i += 2
+    if ln & 0x80:
+        nb = ln & 0x7F; ln = int.from_bytes(buf[i:i + nb], "big"); i += nb
+    return tag, i, i + ln
+
+def rsa_key_from_pem(pem):
+    """Returns (n, d) from a PKCS#8 ('BEGIN PRIVATE KEY') or PKCS#1 ('BEGIN RSA PRIVATE KEY') PEM."""
+    der = base64.b64decode("".join(l for l in pem.strip().splitlines() if not l.startswith("-----")))
+    _, s, _e = _der(der, 0)
+    if "BEGIN PRIVATE KEY" in pem:
+        _, _, i = _der(der, s)       # version
+        _, _, i = _der(der, i)       # algorithm identifier
+        _, s, _e = _der(der, i)      # OCTET STRING holding the RSA key
+        _, s, _e = _der(der, s)      # its SEQUENCE
+    _, _, i = _der(der, s)           # version
+    nums = []
+    for _ in range(3):               # n, e, d
+        _, a, b = _der(der, i); nums.append(int.from_bytes(der[a:b], "big")); i = b
+    return nums[0], nums[2]
+
+def rs256_sign(pem, msg):
+    n, d = rsa_key_from_pem(pem)
+    k = (n.bit_length() + 7) // 8
+    info = bytes.fromhex("3031300d060960864801650304020105000420") + hashlib.sha256(msg).digest()
+    em = b"\x00\x01" + b"\xff" * (k - len(info) - 3) + b"\x00" + info
+    return pow(int.from_bytes(em, "big"), d, n).to_bytes(k, "big")
+
+_fcm_cache = {"tok": None, "exp": 0.0}
+
+def fcm_conf():
+    raw = os.environ.get("FIREBASE_SERVICE_ACCOUNT", "").strip()
+    if not raw: return None
+    try: j = json.loads(raw)
+    except ValueError: return None
+    return j if all(j.get(k) for k in ("project_id", "client_email", "private_key")) else None
+
+def fcm_access_token(cf):
+    if _fcm_cache["tok"] and time.time() < _fcm_cache["exp"] - 60: return _fcm_cache["tok"]
+    b64 = lambda b: base64.urlsafe_b64encode(b).rstrip(b"=").decode()
+    now = int(time.time())
+    signing = b64(json.dumps({"alg": "RS256", "typ": "JWT"}).encode()) + "." + b64(json.dumps({
+        "iss": cf["client_email"], "scope": "https://www.googleapis.com/auth/firebase.messaging",
+        "aud": "https://oauth2.googleapis.com/token", "iat": now, "exp": now + 3600}).encode())
+    jwt = signing + "." + b64(rs256_sign(cf["private_key"], signing.encode()))
+    body = urllib.parse.urlencode({"grant_type": "urn:ietf:params:oauth:grant-type:jwt-bearer", "assertion": jwt}).encode()
+    r = json.loads(urllib.request.urlopen(urllib.request.Request("https://oauth2.googleapis.com/token", data=body), timeout=20).read())
+    _fcm_cache["tok"], _fcm_cache["exp"] = r["access_token"], time.time() + int(r.get("expires_in", 3600))
+    return _fcm_cache["tok"]
+
+def fcm_send(cf, token, title, body, data):
+    msg = {"message": {"token": token, "notification": {"title": title, "body": body},
+                       "data": {k: str(v) for k, v in data.items()},
+                       "android": {"priority": "HIGH", "notification": {"channel_id": "viora_activity"}}}}
+    req = urllib.request.Request(f"https://fcm.googleapis.com/v1/projects/{cf['project_id']}/messages:send", data=json.dumps(msg).encode(),
+                                 headers={"Authorization": "Bearer " + fcm_access_token(cf), "Content-Type": "application/json"})
+    try:
+        urllib.request.urlopen(req, timeout=20).read(); return "ok"
+    except urllib.error.HTTPError as e:
+        err = e.read()[:400]
+        print("push error:", e.code, err, flush=True)
+        return "gone" if e.code == 404 or b"UNREGISTERED" in err else "error"
+
+def push_user(user_id, title, body, data):
+    cf = fcm_conf()
+    if not cf: return
+    try:
+        with db() as c:
+            tokens = [r["token"] for r in c.execute("SELECT token FROM devices WHERE user_id=?", (user_id,)).fetchall()]
+        for t in tokens:
+            if fcm_send(cf, t, title, body, data) == "gone":   # app uninstalled or token replaced
+                with db() as c: c.execute("DELETE FROM devices WHERE token=?", (t,))
+    except Exception:
+        traceback.print_exc()
+
+def push_async(user_id, title, body, data):
+    if fcm_conf(): threading.Thread(target=push_user, args=(user_id, title, body, data), daemon=True).start()
+
+def notify(c, user_id, actor, kind, text, post_id=None):
+    """Adds an Activity entry and sends a push. Skips your own actions and repeated likes/follows."""
+    user_id = int(user_id)
+    if user_id == actor["id"]: return
+    if kind in ("like", "follow") and c.execute("SELECT 1 FROM notifications WHERE user_id=? AND actor_id=? AND kind=? AND COALESCE(post_id,0)=?",
+                                               (user_id, actor["id"], kind, post_id or 0)).fetchone(): return
+    c.execute("INSERT INTO notifications(user_id,actor_id,kind,post_id,text,created) VALUES(?,?,?,?,?,?)",
+              (user_id, actor["id"], kind, post_id, text, time.time()))
+    push_async(user_id, "Viora", f"{actor['username']} {text}",
+               {"viora_type": kind, "viora_post": post_id or "", "viora_user": actor["username"]})
+
+@route("POST", "/api/devices")
+def register_device(h, q):
+    tok = str(h.json_body().get("token", "")).strip()
+    if not 20 <= len(tok) <= 500: raise HTTPError(400, "Bad token")
+    with db() as c:
+        u = h.user(c)
+        c.execute("DELETE FROM devices WHERE token=?", (tok,))
+        c.execute("INSERT INTO devices(token,user_id,created) VALUES(?,?,?)", (tok, u["id"], time.time()))
+        c.execute("DELETE FROM devices WHERE user_id=? AND token NOT IN (SELECT token FROM devices WHERE user_id=? ORDER BY created DESC LIMIT 5)", (u["id"], u["id"]))
+    h.send_json(200, {"ok": True})
+
+@route("POST", "/api/devices/remove")
+def remove_device(h, q):
+    tok = str(h.json_body().get("token", "")).strip()
+    with db() as c:
+        u = h.user(c)
+        c.execute("DELETE FROM devices WHERE token=? AND user_id=?", (tok, u["id"]))
+    h.send_json(200, {"ok": True})
+
+@route("GET", "/api/notifications")
+def list_notifications(h, q):
+    with db() as c:
+        u = h.user(c)
+        rows = c.execute("SELECT n.id, n.kind, n.post_id, n.text, n.created, n.seen, a.username, a.avatar FROM notifications n "
+                         "JOIN users a ON a.id=n.actor_id WHERE n.user_id=? ORDER BY n.id DESC LIMIT 50", (u["id"],)).fetchall()
+        out = [{"id": r["id"], "kind": r["kind"], "post_id": r["post_id"], "text": r["text"] or "", "created": int(r["created"] or 0),
+                "new": not r["seen"], "user": r["username"], "avatar": h.url(r["avatar"])} for r in rows]
+        c.execute("UPDATE notifications SET seen=1 WHERE user_id=? AND seen=0", (u["id"],))
+    h.send_json(200, {"notifications": out})
+
+# ---------- Direct messages (1:1 text; the app polls, new messages also arrive as pushes) ----------
+DM_MAX_LEN = 1000
+
+def dm_json(r, me):
+    return {"id": r["id"], "mine": r["sender_id"] == me, "text": r["text"], "created": int(r["created"] or 0)}
+
+@route("GET", "/api/messages/unread")
+def dm_unread(h, q):
+    with db() as c:
+        u = h.user(c)
+        n = c.execute("SELECT COUNT(*) AS n FROM messages WHERE recipient_id=? AND seen=0", (u["id"],)).fetchone()["n"]
+        a = c.execute("SELECT COUNT(*) AS n FROM notifications WHERE user_id=? AND seen=0", (u["id"],)).fetchone()["n"]
+    h.send_json(200, {"count": int(n), "activity": int(a)})
+
+@route("GET", "/api/messages")
+def dm_inbox(h, q):
+    with db() as c:
+        me = h.user(c)["id"]
+        rows = c.execute(
+            "SELECT other, MAX(id) AS last_id, SUM(CASE WHEN recipient_id=? AND seen=0 THEN 1 ELSE 0 END) AS unread FROM "
+            "(SELECT id, recipient_id, seen, CASE WHEN sender_id=? THEN recipient_id ELSE sender_id END AS other "
+            "FROM messages WHERE sender_id=? OR recipient_id=?) t GROUP BY other ORDER BY last_id DESC LIMIT 100", (me, me, me, me)).fetchall()
+        out = []
+        for r in rows:
+            m = c.execute("SELECT * FROM messages WHERE id=?", (r["last_id"],)).fetchone()
+            o = c.execute("SELECT username, avatar FROM users WHERE id=?", (r["other"],)).fetchone()
+            if not m or not o: continue
+            out.append({"user": o["username"], "avatar": h.url(o["avatar"]), "text": m["text"], "mine": m["sender_id"] == me,
+                        "created": int(m["created"] or 0), "unread": int(r["unread"] or 0)})
+    h.send_json(200, {"conversations": out})
+
+@route("GET", r"/api/messages/with/([A-Za-z0-9_.]{3,20})")
+def dm_thread(h, q, name):
+    try: after = int(q.get("after", ["0"])[0])
+    except ValueError: after = 0
+    with db() as c:
+        me = h.user(c)["id"]; t = target_user(c, name)
+        rows = c.execute("SELECT * FROM messages WHERE ((sender_id=? AND recipient_id=?) OR (sender_id=? AND recipient_id=?)) AND id>? "
+                         "ORDER BY id DESC LIMIT 100", (me, t["id"], t["id"], me, after)).fetchall()
+        c.execute("UPDATE messages SET seen=1 WHERE recipient_id=? AND sender_id=? AND seen=0", (me, t["id"]))
+    h.send_json(200, {"messages": [dm_json(r, me) for r in reversed(rows)],
+                      "user": {"username": t["username"], "avatar": h.url(t["avatar"])}})
+
+@route("POST", r"/api/messages/to/([A-Za-z0-9_.]{3,20})")
+def dm_send(h, q, name):
+    text = str(h.json_body().get("text", "")).strip()
+    if not text: raise HTTPError(400, "Write a message first")
+    if len(text) > DM_MAX_LEN: raise HTTPError(400, f"Messages can be at most {DM_MAX_LEN} characters")
+    with db() as c:
+        u = h.user(c); t = target_user(c, name)
+        if t["id"] == u["id"]: raise HTTPError(400, "You can't message yourself")
+        now = time.time()
+        if c.execute("SELECT COUNT(*) AS n FROM messages WHERE sender_id=? AND created>?", (u["id"], now - 60)).fetchone()["n"] >= 30:
+            raise HTTPError(429, "You're sending messages too fast. Wait a moment.")
+        mid = c.execute("INSERT INTO messages(sender_id,recipient_id,text,created) VALUES(?,?,?,?) RETURNING id",
+                        (u["id"], t["id"], text, now)).fetchone()["id"]
+    push_async(t["id"], u["username"], text[:120], {"viora_type": "message", "viora_user": u["username"]})
+    h.send_json(201, {"message": {"id": mid, "mine": True, "text": text, "created": int(now)}})
+
 @route("POST", r"/api/users/([A-Za-z0-9_.]{3,20})/follow")
 def follow(h, q, name):
     with db() as c:
         me = h.user(c); t = target_user(c, name)
         if t["id"] == me["id"]: raise HTTPError(400, "You can't follow yourself")
-        c.execute("INSERT INTO follows(follower_id,followee_id,created) VALUES(?,?,?) ON CONFLICT DO NOTHING", (me["id"], t["id"], time.time()))
+        added = c.execute("INSERT INTO follows(follower_id,followee_id,created) VALUES(?,?,?) ON CONFLICT DO NOTHING", (me["id"], t["id"], time.time())).rowcount
+        if added: notify(c, t["id"], me, "follow", "started following you")
         n = follower_count(c, t["id"])
     h.send_json(200, {"following": True, "followers": n})
 
@@ -1187,6 +1375,8 @@ def like(h, q, pid):
         if c.execute("DELETE FROM likes WHERE post_id=? AND user_id=?", (pid, u["id"])).rowcount: liked = False
         else:
             c.execute("INSERT INTO likes(post_id,user_id) VALUES(?,?)", (pid, u["id"])); liked = True
+            owner = c.execute("SELECT user_id FROM posts WHERE id=?", (pid,)).fetchone()["user_id"]
+            notify(c, owner, u, "like", "liked your post", int(pid))
         n = c.execute("SELECT COUNT(*) AS n FROM likes WHERE post_id=?", (pid,)).fetchone()["n"]
     h.send_json(200, {"liked": liked, "likes": n})
 
@@ -1210,6 +1400,8 @@ def add_comment(h, q, pid):
         if not c.execute("SELECT 1 FROM posts WHERE id=?", (pid,)).fetchone(): raise HTTPError(404, "Post not found")
         now = time.time()
         c.execute("INSERT INTO comments(post_id,user_id,text,created) VALUES(?,?,?,?)", (pid, u["id"], text, now))
+        owner = c.execute("SELECT user_id FROM posts WHERE id=?", (pid,)).fetchone()["user_id"]
+        notify(c, owner, u, "comment", "commented: " + text[:80], int(pid))
     h.send_json(201, {"comment": {"user": u["username"], "avatar": h.url(u["avatar"]), "text": text, "created": int(now)}})
 
 @route("GET", "/api/stories")
