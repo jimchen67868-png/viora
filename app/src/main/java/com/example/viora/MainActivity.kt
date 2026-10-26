@@ -1843,6 +1843,7 @@ fun SettingsScreen(vm: AppVm, onClose: () -> Unit) {
     var privacyOpen by remember { mutableStateOf(false) }
     var privateConfirm by remember { mutableStateOf(false) }
     val unverified = me.email != null && !me.emailVerified
+    LaunchedEffect(Unit) { vm.reloadMe() }   // fresh follow-request and running-boost counts
     Dialog(onDismissRequest = onClose, properties = DialogProperties(usePlatformDefaultWidth = false)) {
         Surface(Modifier.fillMaxSize()) {
             Column(Modifier.padding(top = 24.dp).verticalScroll(rememberScrollState())) {
@@ -1895,8 +1896,24 @@ fun SettingsScreen(vm: AppVm, onClose: () -> Unit) {
             if (privateConfirm) AlertDialog(
                 onDismissRequest = { privateConfirm = false },
                 title = { Text("Make your account private?") },
-                text = { Text("Only people you approve will see your posts and stories. Your current followers stay. New people must send a request.\n\nAny boost running on your posts stops right away. It is not restored if you go public again, and it is not refunded automatically.") },
-                confirmButton = { TextButton({ privateConfirm = false; vm.setPrivateAccount(true) }) { Text("Make private") } },
+                text = {
+                    Column {
+                        Text("Only people you approve will see your posts and stories. Your current followers stay. New people must send a request.")
+                        if (me.activeBoosts > 0) {   // only people who are paying for a running boost see this
+                            Spacer(Modifier.height(12.dp))
+                            Text(
+                                "⚠ You have ${me.activeBoosts} boosted post${if (me.activeBoosts == 1) "" else "s"} running. " +
+                                    "Any boost running on your posts stops right away. It is not restored if you go public again, and it is not refundable.",
+                                color = Color(0xFFC62828), fontWeight = FontWeight.Medium
+                            )
+                        }
+                    }
+                },
+                confirmButton = {
+                    TextButton({ privateConfirm = false; vm.setPrivateAccount(true) }) {
+                        Text(if (me.activeBoosts > 0) "Stop boosts and go private" else "Make private")
+                    }
+                },
                 dismissButton = { TextButton({ privateConfirm = false }) { Text("Cancel") } }
             )
             if (privacyOpen) AlertDialog(

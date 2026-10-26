@@ -33,7 +33,8 @@ class Profile(
     val email: String? = null, val emailVerified: Boolean = false, val vip: Boolean = false, val vipUntil: Long? = null, val accountId: String? = null,
     val followers: Int = 0, val following: Int = 0, val isFollowing: Boolean = false,
     val followingPrivacy: String = "everyone",
-    val isPrivate: Boolean = false, val requested: Boolean = false, val locked: Boolean = false, val followRequests: Int = 0
+    val isPrivate: Boolean = false, val requested: Boolean = false, val locked: Boolean = false, val followRequests: Int = 0,
+    val activeBoosts: Int = 0
 )
 class Plan(val id: String, val name: String, val price: String)
 class Convo(val user: String, val avatar: String?, val text: String, val mine: Boolean, val created: Long, val unread: Int)
@@ -81,7 +82,7 @@ private fun JSONObject.toProfile() =
         followers = optInt("followers", 0), following = optInt("following", 0), isFollowing = optBoolean("is_following", false),
         followingPrivacy = optString("following_privacy", "everyone"),
         isPrivate = optBoolean("is_private", false), requested = optBoolean("requested", false), locked = optBoolean("locked", false),
-        followRequests = optInt("follow_requests", 0))
+        followRequests = optInt("follow_requests", 0), activeBoosts = optInt("active_boosts", 0))
 private fun JSONObject.toDm() = Dm(getInt("id"), getBoolean("mine"), getString("text"), optLong("created", 0L))
 private fun JSONObject.toComment() = Comment(getString("user"), str("avatar"), getString("text"), optLong("created", 0L))
 private fun JSONObject.toPost() = Post(

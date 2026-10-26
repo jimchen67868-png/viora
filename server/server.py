@@ -555,7 +555,8 @@ class H(BaseHTTPRequestHandler):
             fr = c.execute("SELECT COUNT(*) AS n FROM follows WHERE followee_id=?", (u["id"],)).fetchone()["n"]
             fg = c.execute("SELECT COUNT(*) AS n FROM follows WHERE follower_id=?", (u["id"],)).fetchone()["n"]
             rq = c.execute("SELECT COUNT(*) AS n FROM follow_requests WHERE target_id=?", (u["id"],)).fetchone()["n"]
-        return {"is_private": bool(u["is_private"]), "follow_requests": rq, "username": u["username"], "bio": u["bio"], "avatar": self.url(u["avatar"]),
+            ab = c.execute("SELECT COUNT(DISTINCT post_id) AS n FROM boosts WHERE user_id=? AND ends>?", (u["id"], time.time())).fetchone()["n"]
+        return {"is_private": bool(u["is_private"]), "follow_requests": rq, "active_boosts": int(ab), "username": u["username"], "bio": u["bio"], "avatar": self.url(u["avatar"]),
                 "email": u["email"], "email_verified": bool(u["email_verified"]), "vip": vip_active(u),
                 "followers": fr, "following": fg, "account_id": account_id(u["id"]), "following_privacy": u["following_privacy"] or "everyone",
                 "vip_until": (u["vip_until"] if not u["is_vip"] and (u["vip_until"] or 0) > time.time() else None)}
