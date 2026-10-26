@@ -37,11 +37,12 @@ SCHEMA = [
  f"CREATE TABLE IF NOT EXISTS codes(id {PK}, user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE, kind TEXT NOT NULL, email TEXT NOT NULL, code_hash TEXT NOT NULL, expires DOUBLE PRECISION, created DOUBLE PRECISION, attempts INTEGER NOT NULL DEFAULT 0)",
  "CREATE TABLE IF NOT EXISTS follows(follower_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE, followee_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE, created DOUBLE PRECISION, PRIMARY KEY(follower_id, followee_id))",
  "CREATE TABLE IF NOT EXISTS post_views(post_id INTEGER NOT NULL REFERENCES posts(id) ON DELETE CASCADE, user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE, created DOUBLE PRECISION, PRIMARY KEY(post_id, user_id))",
- f"CREATE TABLE IF NOT EXISTS boosts(id {PK}, post_id INTEGER NOT NULL REFERENCES posts(id) ON DELETE CASCADE, user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE, days INTEGER NOT NULL, ends DOUBLE PRECISION NOT NULL, created DOUBLE PRECISION, session_id TEXT, views INTEGER NOT NULL DEFAULT 0)",
+ f"CREATE TABLE IF NOT EXISTS boosts(id {PK}, post_id INTEGER NOT NULL REFERENCES posts(id) ON DELETE CASCADE, user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE, days INTEGER NOT NULL, ends DOUBLE PRECISION NOT NULL, created DOUBLE PRECISION, session_id TEXT, views INTEGER NOT NULL DEFAULT 0, paused_at DOUBLE PRECISION)",
  f"CREATE TABLE IF NOT EXISTS messages(id {PK}, sender_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE, recipient_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE, text TEXT NOT NULL, created DOUBLE PRECISION, seen INTEGER NOT NULL DEFAULT 0)",
  "CREATE TABLE IF NOT EXISTS devices(token TEXT PRIMARY KEY, user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE, created DOUBLE PRECISION)",
  f"CREATE TABLE IF NOT EXISTS notifications(id {PK}, user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE, actor_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE, kind TEXT NOT NULL, post_id INTEGER REFERENCES posts(id) ON DELETE CASCADE, text TEXT, created DOUBLE PRECISION, seen INTEGER NOT NULL DEFAULT 0)",
  "CREATE INDEX IF NOT EXISTS notifications_user ON notifications(user_id, seen)",
+ "CREATE TABLE IF NOT EXISTS follow_requests(requester_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE, target_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE, created DOUBLE PRECISION, PRIMARY KEY(requester_id, target_id))",
  "CREATE TABLE IF NOT EXISTS dm_cleared(user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE, other_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE, upto INTEGER NOT NULL, PRIMARY KEY(user_id, other_id))",
  "CREATE INDEX IF NOT EXISTS messages_recipient ON messages(recipient_id, sender_id, seen)",
  "CREATE INDEX IF NOT EXISTS messages_sender ON messages(sender_id, recipient_id)",
@@ -71,7 +72,7 @@ def db(): return DB()
 
 with db() as _c:
     for _s in SCHEMA: _c.execute(_s)
-for _col, _typ in (("email", "TEXT"), ("email_verified", "INTEGER NOT NULL DEFAULT 0"), ("is_vip", "INTEGER NOT NULL DEFAULT 0"), ("vip_until", "DOUBLE PRECISION"), ("stripe_customer", "TEXT"), ("play_token", "TEXT"), ("following_privacy", "TEXT NOT NULL DEFAULT 'everyone'")):
+for _col, _typ in (("email", "TEXT"), ("email_verified", "INTEGER NOT NULL DEFAULT 0"), ("is_vip", "INTEGER NOT NULL DEFAULT 0"), ("vip_until", "DOUBLE PRECISION"), ("stripe_customer", "TEXT"), ("play_token", "TEXT"), ("following_privacy", "TEXT NOT NULL DEFAULT 'everyone'"), ("is_private", "INTEGER NOT NULL DEFAULT 0")):
     try:  # add columns to databases created before email support existed
         with db() as _c: _c.execute(f"ALTER TABLE users ADD COLUMN {'IF NOT EXISTS ' if PG else ''}{_col} {_typ}")
     except Exception:
@@ -81,6 +82,14 @@ for _col, _typ in (("kind", "TEXT NOT NULL DEFAULT 'image'"), ("thumb", "TEXT"))
         with db() as _c: _c.execute(f"ALTER TABLE posts ADD COLUMN {'IF NOT EXISTS ' if PG else ''}{_col} {_typ}")
     except Exception:
         pass
+try:  # boosts pause while the account is private
+    with db() as _c: _c.execute(f"ALTER TABLE boosts ADD COLUMN {'IF NOT EXISTS ' if PG else ''}paused_at DOUBLE PRECISION")
+except Exception:
+    pass
+try:  # boosts paused by an earlier version end at the moment they were paused
+    with db() as _c: _c.execute("UPDATE boosts SET ends=paused_at, paused_at=NULL WHERE paused_at IS NOT NULL")
+except Exception:
+    pass
 with db() as _c:  # an email can belong to only one account once verified
     _c.execute("CREATE UNIQUE INDEX IF NOT EXISTS users_email ON users(LOWER(email)) WHERE email_verified=1")
 
@@ -545,12 +554,16 @@ class H(BaseHTTPRequestHandler):
         with db() as c:
             fr = c.execute("SELECT COUNT(*) AS n FROM follows WHERE followee_id=?", (u["id"],)).fetchone()["n"]
             fg = c.execute("SELECT COUNT(*) AS n FROM follows WHERE follower_id=?", (u["id"],)).fetchone()["n"]
-        return {"username": u["username"], "bio": u["bio"], "avatar": self.url(u["avatar"]),
+            rq = c.execute("SELECT COUNT(*) AS n FROM follow_requests WHERE target_id=?", (u["id"],)).fetchone()["n"]
+        return {"is_private": bool(u["is_private"]), "follow_requests": rq, "username": u["username"], "bio": u["bio"], "avatar": self.url(u["avatar"]),
                 "email": u["email"], "email_verified": bool(u["email_verified"]), "vip": vip_active(u),
                 "followers": fr, "following": fg, "account_id": account_id(u["id"]), "following_privacy": u["following_privacy"] or "everyone",
                 "vip_until": (u["vip_until"] if not u["is_vip"] and (u["vip_until"] or 0) > time.time() else None)}
 
     def post_json(self, c, uid, where="", args=(), limit=100):
+        vis = "(u.is_private=0 OR p.user_id=? OR p.user_id IN (SELECT followee_id FROM follows WHERE follower_id=?))"
+        where = f"{where} AND {vis}" if where.strip() else f"WHERE {vis}"
+        args = (*args, uid, uid)
         rows = c.execute(f"""SELECT p.id, p.caption, p.image, p.kind, p.thumb, p.created, u.username, u.avatar,
             (SELECT COUNT(*) FROM likes WHERE post_id=p.id) AS likes,
             EXISTS(SELECT 1 FROM likes WHERE post_id=p.id AND user_id=?) AS liked,
@@ -673,6 +686,41 @@ def update_me(h, q):
         u = c.execute("SELECT * FROM users WHERE id=?", (u["id"],)).fetchone()
     h.send_json(200, {"user": h.profile(u)})
 
+@route("PUT", "/api/me/account")
+def set_account(h, q):
+    private = 1 if h.json_body().get("private") is True else 0
+    with db() as c:
+        u = h.user(c)
+        c.execute("UPDATE users SET is_private=? WHERE id=?", (private, u["id"]))
+        if private:   # private accounts can't be promoted: every running or queued boost stops now and is not restored
+            c.execute("UPDATE boosts SET ends=?, paused_at=NULL WHERE user_id=? AND ends>?", (time.time(), u["id"], time.time()))
+        if not private:   # going public approves everyone who was waiting
+            c.execute("INSERT INTO follows(follower_id,followee_id,created) SELECT requester_id, target_id, ? FROM follow_requests WHERE target_id=? ON CONFLICT DO NOTHING",
+                      (time.time(), u["id"]))
+            c.execute("DELETE FROM follow_requests WHERE target_id=?", (u["id"],))
+        u = c.execute("SELECT * FROM users WHERE id=?", (u["id"],)).fetchone()
+    h.send_json(200, {"user": h.profile(u)})
+
+@route("GET", "/api/follow-requests")
+def list_requests(h, q):
+    with db() as c:
+        me = h.user(c)
+        rows = c.execute("SELECT u.username, u.bio, u.avatar FROM follow_requests f JOIN users u ON u.id=f.requester_id WHERE f.target_id=? "
+                         "ORDER BY f.created DESC LIMIT 200", (me["id"],)).fetchall()
+    h.send_json(200, {"users": [{"username": r["username"], "bio": r["bio"], "avatar": h.url(r["avatar"])} for r in rows]})
+
+@route("POST", r"/api/follow-requests/([A-Za-z0-9_.]{3,20})/(accept|decline)")
+def answer_request(h, q, name, action):
+    with db() as c:
+        me = h.user(c); r = target_user(c, name)
+        if not c.execute("SELECT 1 FROM follow_requests WHERE requester_id=? AND target_id=?", (r["id"], me["id"])).fetchone():
+            raise HTTPError(404, "That request is no longer there")
+        c.execute("DELETE FROM follow_requests WHERE requester_id=? AND target_id=?", (r["id"], me["id"]))
+        if action == "accept":
+            c.execute("INSERT INTO follows(follower_id,followee_id,created) VALUES(?,?,?) ON CONFLICT DO NOTHING", (r["id"], me["id"], time.time()))
+            notify(c, r["id"], me, "follow_accept", "accepted your follow request")
+    h.send_json(200, {"ok": True})
+
 @route("PUT", "/api/me/privacy")
 def set_privacy(h, q):
     mode = str(h.json_body().get("following_privacy", "")).strip()
@@ -793,9 +841,12 @@ def user_profile(h, q, name):
         fr = c.execute("SELECT COUNT(*) AS n FROM follows WHERE followee_id=?", (u["id"],)).fetchone()["n"]
         fg = c.execute("SELECT COUNT(*) AS n FROM follows WHERE follower_id=?", (u["id"],)).fetchone()["n"]
         isf = c.execute("SELECT 1 FROM follows WHERE follower_id=? AND followee_id=?", (me["id"], u["id"])).fetchone() is not None
+        requested = c.execute("SELECT 1 FROM follow_requests WHERE requester_id=? AND target_id=?", (me["id"], u["id"])).fetchone() is not None
+        private = bool(u["is_private"])
     # public view: never include the email
     h.send_json(200, {"user": {"username": u["username"], "bio": u["bio"], "avatar": h.url(u["avatar"]),
-                               "followers": fr, "following": fg, "is_following": isf}, "posts": posts})
+                               "followers": fr, "following": fg, "is_following": isf, "is_private": private, "requested": requested,
+                               "locked": private and not isf and u["id"] != me["id"]}, "posts": posts})
 
 @route("GET", "/api/search")
 def search(h, q):
@@ -932,6 +983,11 @@ def google_sync(h, q):
             u = c.execute("SELECT * FROM users WHERE id=?", (u["id"],)).fetchone()
     h.send_json(200, {"user": h.profile(u)})
 
+def post_visible(c, viewer_id, pid):
+    """False if the post doesn't exist or belongs to a private account the viewer doesn't follow."""
+    return c.execute("SELECT 1 FROM posts p JOIN users u ON u.id=p.user_id WHERE p.id=? AND (u.is_private=0 OR p.user_id=? OR "
+                     "p.user_id IN (SELECT followee_id FROM follows WHERE follower_id=?))", (int(pid), viewer_id, viewer_id)).fetchone() is not None
+
 def target_user(c, name):
     t = c.execute("SELECT * FROM users WHERE LOWER(username)=LOWER(?)", (name,)).fetchone()
     if not t: raise HTTPError(404, "User not found")
@@ -1025,7 +1081,7 @@ def notify(c, user_id, actor, kind, text, post_id=None):
     """Adds an Activity entry and sends a push. Skips your own actions and repeated likes/follows."""
     user_id = int(user_id)
     if user_id == actor["id"]: return
-    if kind in ("like", "follow") and c.execute("SELECT 1 FROM notifications WHERE user_id=? AND actor_id=? AND kind=? AND COALESCE(post_id,0)=?",
+    if kind in ("like", "follow", "request") and c.execute("SELECT 1 FROM notifications WHERE user_id=? AND actor_id=? AND kind=? AND COALESCE(post_id,0)=?",
                                                (user_id, actor["id"], kind, post_id or 0)).fetchone(): return
     c.execute("INSERT INTO notifications(user_id,actor_id,kind,post_id,text,created) VALUES(?,?,?,?,?,?)",
               (user_id, actor["id"], kind, post_id, text, time.time()))
@@ -1145,23 +1201,33 @@ def follow(h, q, name):
     with db() as c:
         me = h.user(c); t = target_user(c, name)
         if t["id"] == me["id"]: raise HTTPError(400, "You can't follow yourself")
-        added = c.execute("INSERT INTO follows(follower_id,followee_id,created) VALUES(?,?,?) ON CONFLICT DO NOTHING", (me["id"], t["id"], time.time())).rowcount
-        if added: notify(c, t["id"], me, "follow", "started following you")
+        already = c.execute("SELECT 1 FROM follows WHERE follower_id=? AND followee_id=?", (me["id"], t["id"])).fetchone() is not None
+        requested = False
+        if t["is_private"] and not already:   # private accounts approve followers first
+            added = c.execute("INSERT INTO follow_requests(requester_id,target_id,created) VALUES(?,?,?) ON CONFLICT DO NOTHING", (me["id"], t["id"], time.time())).rowcount
+            if added: notify(c, t["id"], me, "request", "requested to follow you")
+            requested = True
+        else:
+            added = c.execute("INSERT INTO follows(follower_id,followee_id,created) VALUES(?,?,?) ON CONFLICT DO NOTHING", (me["id"], t["id"], time.time())).rowcount
+            if added: notify(c, t["id"], me, "follow", "started following you")
         n = follower_count(c, t["id"])
-    h.send_json(200, {"following": True, "followers": n})
+    h.send_json(200, {"following": not requested, "requested": requested, "followers": n})
 
 @route("DELETE", r"/api/users/([A-Za-z0-9_.]{3,20})/follow")
 def unfollow(h, q, name):
     with db() as c:
         me = h.user(c); t = target_user(c, name)
         c.execute("DELETE FROM follows WHERE follower_id=? AND followee_id=?", (me["id"], t["id"]))
+        c.execute("DELETE FROM follow_requests WHERE requester_id=? AND target_id=?", (me["id"], t["id"]))   # also cancels a pending request
         n = follower_count(c, t["id"])
-    h.send_json(200, {"following": False, "followers": n})
+    h.send_json(200, {"following": False, "requested": False, "followers": n})
 
 @route("GET", r"/api/users/([A-Za-z0-9_.]{3,20})/(followers|following)")
 def follow_list(h, q, name, kind):
     with db() as c:
         me = h.user(c); t = target_user(c, name)
+        if t["is_private"] and t["id"] != me["id"] and not c.execute("SELECT 1 FROM follows WHERE follower_id=? AND followee_id=?", (me["id"], t["id"])).fetchone():
+            raise HTTPError(403, "This account is private")
         if kind == "following" and t["id"] != me["id"]:
             mode = t["following_privacy"] or "everyone"
             if mode == "me":
@@ -1317,6 +1383,7 @@ def boost_checkout(h, q):
     with db() as c:
         u = h.user(c)
         if not c.execute("SELECT 1 FROM posts WHERE id=? AND user_id=?", (pid, u["id"])).fetchone(): raise HTTPError(404, "Post not found")
+        if u["is_private"]: raise HTTPError(400, "Private accounts can't boost posts. Switch to a public account first.")
         email = u["email"] if u["email_verified"] else None
     params = {"mode": "payment", "line_items[0][quantity]": "1",
               "line_items[0][price_data][currency]": boost_currency(),
@@ -1370,7 +1437,7 @@ def ads(h, q):
     with db() as c:
         u = h.user(c)
         if vip_active(u): return h.send_json(200, {"posts": []})
-        rows = c.execute("SELECT DISTINCT post_id FROM boosts WHERE ends>? AND user_id<>?", (time.time(), u["id"])).fetchall()
+        rows = c.execute("SELECT DISTINCT post_id FROM boosts WHERE ends>? AND user_id<>? AND user_id NOT IN (SELECT id FROM users WHERE is_private=1)", (time.time(), u["id"])).fetchall()
         ids = [r["post_id"] for r in rows]
         random.shuffle(ids)
         posts = []
@@ -1419,7 +1486,7 @@ def delete_post(h, q, pid):
 def like(h, q, pid):
     with db() as c:
         u = h.user(c)
-        if not c.execute("SELECT 1 FROM posts WHERE id=?", (pid,)).fetchone(): raise HTTPError(404, "Post not found")
+        if not post_visible(c, u["id"], pid): raise HTTPError(404, "Post not found")
         if c.execute("DELETE FROM likes WHERE post_id=? AND user_id=?", (pid, u["id"])).rowcount: liked = False
         else:
             c.execute("INSERT INTO likes(post_id,user_id) VALUES(?,?)", (pid, u["id"])); liked = True
@@ -1434,7 +1501,7 @@ def comment_json(h, r):
 @route("GET", r"/api/posts/(\d+)/comments")
 def list_comments(h, q, pid):
     with db() as c:
-        h.user(c)
+        if not post_visible(c, h.user(c)["id"], pid): raise HTTPError(404, "Post not found")
         rows = c.execute("""SELECT c.text, c.created, u.username, u.avatar FROM comments c JOIN users u ON u.id=c.user_id
                             WHERE c.post_id=? ORDER BY c.id""", (pid,)).fetchall()
     h.send_json(200, {"comments": [comment_json(h, r) for r in rows]})
@@ -1445,7 +1512,7 @@ def add_comment(h, q, pid):
     if not text: raise HTTPError(400, "Comment is empty")
     with db() as c:
         u = h.user(c)
-        if not c.execute("SELECT 1 FROM posts WHERE id=?", (pid,)).fetchone(): raise HTTPError(404, "Post not found")
+        if not post_visible(c, u["id"], pid): raise HTTPError(404, "Post not found")
         now = time.time()
         c.execute("INSERT INTO comments(post_id,user_id,text,created) VALUES(?,?,?,?)", (pid, u["id"], text, now))
         owner = c.execute("SELECT user_id FROM posts WHERE id=?", (pid,)).fetchone()["user_id"]
@@ -1455,9 +1522,10 @@ def add_comment(h, q, pid):
 @route("GET", "/api/stories")
 def list_stories(h, q):
     with db() as c:
-        h.user(c)
+        me = h.user(c)["id"]   # only your own stories and those of people you follow
         rows = c.execute("""SELECT s.image, u.username, u.avatar FROM stories s JOIN users u ON u.id=s.user_id
-                            WHERE s.created>? ORDER BY s.id""", (time.time() - STORY_TTL,)).fetchall()
+                            WHERE s.created>? AND (s.user_id=? OR s.user_id IN (SELECT followee_id FROM follows WHERE follower_id=?))
+                            ORDER BY s.id""", (time.time() - STORY_TTL, me, me)).fetchall()
     out = {}
     for r in rows:
         g = out.setdefault(r["username"], {"user": r["username"], "avatar": h.url(r["avatar"]), "images": []})

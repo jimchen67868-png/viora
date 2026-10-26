@@ -32,7 +32,8 @@ class Profile(
     val username: String, val bio: String, val avatar: String?,
     val email: String? = null, val emailVerified: Boolean = false, val vip: Boolean = false, val vipUntil: Long? = null, val accountId: String? = null,
     val followers: Int = 0, val following: Int = 0, val isFollowing: Boolean = false,
-    val followingPrivacy: String = "everyone"
+    val followingPrivacy: String = "everyone",
+    val isPrivate: Boolean = false, val requested: Boolean = false, val locked: Boolean = false, val followRequests: Int = 0
 )
 class Plan(val id: String, val name: String, val price: String)
 class Convo(val user: String, val avatar: String?, val text: String, val mine: Boolean, val created: Long, val unread: Int)
@@ -40,7 +41,7 @@ class Dm(val id: Int, val mine: Boolean, val text: String, val created: Long)
 class DmThread(val messages: List<Dm>, val avatar: String?)
 class ActivityItem(val id: Int, val kind: String, val user: String, val avatar: String?, val postId: Int?, val text: String, val created: Long, val isNew: Boolean)
 class BoostPlan(val days: Int, val price: String)
-class BoostInfo(val plans: List<BoostPlan>, val until: Long?, val active: Boolean, val views: Int)
+class BoostInfo(val plans: List<BoostPlan>, val until: Long?, val active: Boolean, val views: Int, val paused: Boolean = false)
 class Comment(val user: String, val avatar: String?, val text: String, val created: Long = 0)
 class Story(val user: String, val avatar: String?, val images: List<String>)
 
@@ -78,7 +79,9 @@ private fun JSONObject.toProfile() =
         if (has("vip_until") && !isNull("vip_until")) getLong("vip_until") else null,
         str("account_id"),
         followers = optInt("followers", 0), following = optInt("following", 0), isFollowing = optBoolean("is_following", false),
-        followingPrivacy = optString("following_privacy", "everyone"))
+        followingPrivacy = optString("following_privacy", "everyone"),
+        isPrivate = optBoolean("is_private", false), requested = optBoolean("requested", false), locked = optBoolean("locked", false),
+        followRequests = optInt("follow_requests", 0))
 private fun JSONObject.toDm() = Dm(getInt("id"), getBoolean("mine"), getString("text"), optLong("created", 0L))
 private fun JSONObject.toComment() = Comment(getString("user"), str("avatar"), getString("text"), optLong("created", 0L))
 private fun JSONObject.toPost() = Post(
@@ -147,7 +150,7 @@ class Api(var base: String, var token: String?) {
         val a = j.getJSONArray("plans")
         val plans = List(a.length()) { val o = a.getJSONObject(it); BoostPlan(o.getInt("days"), o.getString("price")) }
         val s = j.optJSONObject("status")
-        return BoostInfo(plans, s?.optLong("until"), s?.optBoolean("active") ?: false, s?.optInt("views") ?: 0)
+        return BoostInfo(plans, s?.optLong("until"), s?.optBoolean("active") ?: false, s?.optInt("views") ?: 0, s?.optBoolean("paused") ?: false)
     }
     suspend fun boostCheckout(postId: Int, days: Int) =
         send("POST", "/api/boost/checkout", json("post_id" to postId.toString(), "days" to days.toString())).getString("url")
@@ -209,8 +212,20 @@ class Api(var base: String, var token: String?) {
     suspend fun verifyGoogle(token: String) =
         send("POST", "/api/billing/google/verify", json("purchase_token" to token)).getJSONObject("user").toProfile()
     suspend fun syncGoogle() = send("POST", "/api/billing/google/sync").getJSONObject("user").toProfile()
-    suspend fun follow(name: String, on: Boolean): Int =
-        send(if (on) "POST" else "DELETE", "/api/users/" + enc(name) + "/follow").getInt("followers")
+    /** Returns the new follower count and whether the follow is waiting for approval (private account). */
+    suspend fun follow(name: String, on: Boolean): Pair<Int, Boolean> {
+        val j = send(if (on) "POST" else "DELETE", "/api/users/" + enc(name) + "/follow")
+        return j.getInt("followers") to j.optBoolean("requested", false)
+    }
+    suspend fun setPrivateAccount(on: Boolean) =
+        send("PUT", "/api/me/account", JSONObject().put("private", on).toString().toRequestBody(JSON)).getJSONObject("user").toProfile()
+    suspend fun followRequests(): List<Profile> {
+        val a = send("GET", "/api/follow-requests").getJSONArray("users")
+        return List(a.length()) { a.getJSONObject(it).toProfile() }
+    }
+    suspend fun answerRequest(name: String, accept: Boolean) {
+        send("POST", "/api/follow-requests/" + enc(name) + "/" + (if (accept) "accept" else "decline"))
+    }
     suspend fun followList(name: String, kind: String): List<Profile> {
         val a = send("GET", "/api/users/" + enc(name) + "/" + kind).getJSONArray("users")
         return List(a.length()) { a.getJSONObject(it).toProfile() }

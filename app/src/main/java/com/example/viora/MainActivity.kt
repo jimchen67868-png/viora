@@ -356,10 +356,13 @@ class AppVm(app: Application) : AndroidViewModel(app) {
         try { api.resetPassword(email, code, pw); toast("Password changed. Please log in."); ok() } finally { busy = false }
     }
 
-    fun follow(name: String, on: Boolean, done: (Int) -> Unit) = safe {
+    fun follow(name: String, on: Boolean, done: (Int, Boolean) -> Unit) = safe {
         busy = true
-        try { val n = api.follow(name, on); saveMe(api.me()); done(n) } finally { busy = false }
+        try { val (n, requested) = api.follow(name, on); saveMe(api.me()); done(n, requested) } finally { busy = false }
     }
+
+    fun setPrivateAccount(on: Boolean) = safe { saveMe(api.setPrivateAccount(on)) }
+    fun reloadMe() = safe { saveMe(api.me()) }
 
     fun startCheckout(plan: String, open: (String) -> Unit) = safe {
         busy = true
@@ -1249,8 +1252,10 @@ fun BoostDialog(vm: AppVm, p: Post, onClose: () -> Unit) {
                         Text((if (i.active) "Active until " else "Ended ") + fmtDate(until) + "  ·  ${i.views} views",
                             Modifier.padding(top = 8.dp), fontWeight = FontWeight.Medium)
                     Spacer(Modifier.height(8.dp))
-                    if (i.plans.isEmpty()) Text("Boosting isn't available right now.", color = Color.Gray)
-                    for (plan in i.plans) {
+                    val isPrivate = vm.me?.isPrivate == true
+                    if (isPrivate) Text("Boosting isn't available while your account is private.", color = Color.Gray)
+                    else if (i.plans.isEmpty()) Text("Boosting isn't available right now.", color = Color.Gray)
+                    for (plan in (if (isPrivate) emptyList() else i.plans)) {
                         Button(
                             onClick = {
                                 busy = true
@@ -1334,13 +1339,14 @@ fun UserScreen(vm: AppVm, username: String, onClose: () -> Unit) {
     var followers by remember { mutableIntStateOf(0) }
     var following by remember { mutableIntStateOf(0) }
     var iFollow by remember { mutableStateOf(false) }
+    var requested by remember { mutableStateOf(false) }
     var shareOpen by remember { mutableStateOf(false) }
     var listKind by remember { mutableStateOf<String?>(null) }
     LaunchedEffect(username) {
         try {
             val (p, list) = vm.api.user(username)
             profile = p; posts.clear(); posts.addAll(list)
-            followers = p.followers; following = p.following; iFollow = p.isFollowing
+            followers = p.followers; following = p.following; iFollow = p.isFollowing; requested = p.requested
         } catch (e: CancellationException) { throw e }
         catch (e: Exception) { vm.toast(e.message) }
         loading = false
@@ -1371,12 +1377,17 @@ fun UserScreen(vm: AppVm, username: String, onClose: () -> Unit) {
                     if (p.username != vm.me?.username) {
                         if (iFollow)
                             OutlinedButton(
-                                { vm.follow(p.username, false) { n -> iFollow = false; followers = n } },
+                                { vm.follow(p.username, false) { n, _ -> iFollow = false; followers = n } },
                                 Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 4.dp), enabled = !vm.busy
                             ) { Text("Following ✓") }
+                        else if (requested)
+                            OutlinedButton(
+                                { vm.follow(p.username, false) { n, _ -> requested = false; followers = n } },
+                                Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 4.dp), enabled = !vm.busy
+                            ) { Text("Requested") }
                         else
                             Button(
-                                { vm.follow(p.username, true) { n -> iFollow = true; followers = n } },
+                                { vm.follow(p.username, true) { n, waiting -> if (waiting) requested = true else iFollow = true; followers = n } },
                                 Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 4.dp), enabled = !vm.busy
                             ) { Text("Follow") }
                         Row(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 4.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -1385,9 +1396,16 @@ fun UserScreen(vm: AppVm, username: String, onClose: () -> Unit) {
                         }
                     }
                     HorizontalDivider()
-                    if (posts.isEmpty()) Text("No posts yet.", Modifier.padding(16.dp), color = Color.Gray)
+                    val locked = p.isPrivate && !iFollow && p.username != vm.me?.username
+                    val shown = if (locked) emptyList() else posts.toList()
+                    if (locked) Column(Modifier.fillMaxWidth().padding(32.dp), horizontalAlignment = Alignment.CenterHorizontally) {
+                        Text("🔒", fontSize = 32.sp)
+                        Text("This account is private", fontWeight = FontWeight.Bold)
+                        Text("Follow this account to see their photos and videos.", color = Color.Gray, fontSize = 13.sp)
+                    }
+                    else if (posts.isEmpty()) Text("No posts yet.", Modifier.padding(16.dp), color = Color.Gray)
                     LazyVerticalGrid(GridCells.Fixed(3), horizontalArrangement = Arrangement.spacedBy(2.dp), verticalArrangement = Arrangement.spacedBy(2.dp)) {
-                        items(posts, key = { it.id }) {
+                        items(shown, key = { it.id }) {
                             Box(Modifier.aspectRatio(1f).clickable { openPost = it }) {
                                 AsyncImage(it.preview, null, contentScale = ContentScale.Crop, modifier = Modifier.fillMaxSize())
                                 if (it.isVideo) Icon(Icons.Filled.PlayArrow, null, tint = Color.White, modifier = Modifier.align(Alignment.TopEnd).padding(4.dp).size(22.dp))
@@ -1523,6 +1541,48 @@ fun ActivityDialog(vm: AppVm, onClose: () -> Unit) {
             openPost?.let { PostDetail(vm, it) { openPost = null } }
         }
     }
+}
+
+@Composable
+fun FollowRequestsDialog(vm: AppVm, onClose: () -> Unit) {
+    var users by remember { mutableStateOf<List<Profile>?>(null) }
+    val scope = rememberCoroutineScope()
+    LaunchedEffect(Unit) {
+        try { users = vm.api.followRequests() }
+        catch (e: CancellationException) { throw e }
+        catch (e: Exception) { vm.toast(e.message); users = emptyList() }
+    }
+    val close = { vm.reloadMe(); onClose() }
+    AlertDialog(
+        onDismissRequest = { close() },
+        title = { Text("Follow requests") },
+        text = {
+            val list = users
+            when {
+                list == null -> Text("Loading…", color = Color.Gray)
+                list.isEmpty() -> Text("No pending requests.", color = Color.Gray)
+                else -> LazyColumn(Modifier.heightIn(max = 360.dp)) {
+                    items(list, key = { it.username }) { u ->
+                        Row(Modifier.fillMaxWidth().padding(vertical = 4.dp), verticalAlignment = Alignment.CenterVertically) {
+                            Avatar(u.username, u.avatar, Modifier.size(40.dp))
+                            Spacer(Modifier.width(10.dp))
+                            Text(u.username, Modifier.weight(1f), maxLines = 1, overflow = TextOverflow.Ellipsis)
+                            fun answer(accept: Boolean) {
+                                scope.launch {
+                                    try { vm.api.answerRequest(u.username, accept); users = users?.filter { it.username != u.username } }
+                                    catch (e: CancellationException) { throw e }
+                                    catch (e: Exception) { vm.toast(e.message) }
+                                }
+                            }
+                            Button({ answer(true) }) { Text("Accept") }
+                            TextButton({ answer(false) }) { Text("✕") }
+                        }
+                    }
+                }
+            }
+        },
+        confirmButton = { TextButton({ close() }) { Text("Close") } }
+    )
 }
 
 @Composable
@@ -1761,6 +1821,8 @@ fun ProfileScreen(vm: AppVm) {
     var emailOpen by remember { mutableStateOf(false) }
     var vipOpen by remember { mutableStateOf(false) }
     var privacyOpen by remember { mutableStateOf(false) }
+    var requestsOpen by remember { mutableStateOf(false) }
+    var privateConfirm by remember { mutableStateOf(false) }
     var listKind by remember { mutableStateOf<String?>(null) }
     val ctx = LocalContext.current
     var draftName by remember { mutableStateOf("") }
@@ -1793,6 +1855,18 @@ fun ProfileScreen(vm: AppVm) {
             color = if (me.email == null || unverified) Color(0xFFD97706) else Color.Gray,
             fontSize = 13.sp,
             modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp).clickable { emailOpen = true }
+        )
+        Row(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 2.dp), verticalAlignment = Alignment.CenterVertically) {
+            Column(Modifier.weight(1f)) {
+                Text("🔒 Private account", fontSize = 14.sp)
+                Text(if (me.isPrivate) "Only people you approve can see your posts." else "Anyone can see your posts and follow you.", color = Color.Gray, fontSize = 12.sp)
+            }
+            Switch(me.isPrivate, { if (it) privateConfirm = true else vm.setPrivateAccount(false) })
+        }
+        if (me.isPrivate || me.followRequests > 0) Text(
+            "Follow requests" + (if (me.followRequests > 0) " (${me.followRequests})" else ""),
+            color = Color(0xFF8134AF), fontSize = 14.sp, fontWeight = FontWeight.Medium,
+            modifier = Modifier.padding(horizontal = 16.dp, vertical = 6.dp).clickable { requestsOpen = true }
         )
         Text(
             "🔒 Who can see who you follow: " + when (me.followingPrivacy) { "followers" -> "Followers"; "me" -> "Only me"; else -> "Everyone" },
@@ -1832,6 +1906,14 @@ fun ProfileScreen(vm: AppVm) {
     }
     openPost?.let { PostDetail(vm, it) { openPost = null } }
     listKind?.let { FollowListDialog(vm, me.username, it) { listKind = null } }
+    if (requestsOpen) FollowRequestsDialog(vm) { requestsOpen = false }
+    if (privateConfirm) AlertDialog(
+        onDismissRequest = { privateConfirm = false },
+        title = { Text("Make your account private?") },
+        text = { Text("Only people you approve will see your posts and stories. Your current followers stay. New people must send a request.\n\nAny boost running on your posts stops right away. It is not restored if you go public again, and it is not refunded automatically.") },
+        confirmButton = { TextButton({ privateConfirm = false; vm.setPrivateAccount(true) }) { Text("Make private") } },
+        dismissButton = { TextButton({ privateConfirm = false }) { Text("Cancel") } }
+    )
     if (privacyOpen) {
         AlertDialog(
             onDismissRequest = { privacyOpen = false },
