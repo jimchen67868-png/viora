@@ -49,6 +49,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.AddBox
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Email
+import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.Notifications
 import androidx.compose.material.icons.filled.Favorite
 import androidx.compose.material.icons.filled.FavoriteBorder
@@ -1811,6 +1812,115 @@ fun NewPost(vm: AppVm, onDone: () -> Unit) {
     }
 }
 
+// ---------- Settings ----------
+@Composable
+fun SettingsHeader(title: String) {
+    Text(title, fontWeight = FontWeight.Bold, color = Color(0xFF8134AF), fontSize = 13.sp, modifier = Modifier.padding(start = 16.dp, top = 20.dp, bottom = 4.dp))
+}
+
+@Composable
+fun SettingRow(
+    title: String, subtitle: String? = null, titleColor: Color = Color.Unspecified,
+    onClick: (() -> Unit)? = null, trailing: @Composable (() -> Unit)? = null
+) {
+    Row(
+        Modifier.fillMaxWidth().then(if (onClick != null) Modifier.clickable { onClick() } else Modifier).padding(horizontal = 16.dp, vertical = 12.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Column(Modifier.weight(1f)) {
+            Text(title, color = titleColor)
+            if (subtitle != null) Text(subtitle, color = Color.Gray, fontSize = 13.sp)
+        }
+        trailing?.invoke()
+    }
+}
+
+@Composable
+fun SettingsScreen(vm: AppVm, onClose: () -> Unit) {
+    val me = vm.me ?: return
+    var emailOpen by remember { mutableStateOf(false) }
+    var requestsOpen by remember { mutableStateOf(false) }
+    var privacyOpen by remember { mutableStateOf(false) }
+    var privateConfirm by remember { mutableStateOf(false) }
+    val unverified = me.email != null && !me.emailVerified
+    Dialog(onDismissRequest = onClose, properties = DialogProperties(usePlatformDefaultWidth = false)) {
+        Surface(Modifier.fillMaxSize()) {
+            Column(Modifier.padding(top = 24.dp).verticalScroll(rememberScrollState())) {
+                Row(Modifier.padding(horizontal = 8.dp), verticalAlignment = Alignment.CenterVertically) {
+                    IconButton(onClose) { Icon(Icons.Filled.Close, "Close") }
+                    Text("Settings", fontWeight = FontWeight.Bold, fontSize = 18.sp)
+                }
+                HorizontalDivider()
+
+                SettingsHeader("Privacy")
+                SettingRow(
+                    "Private account",
+                    if (me.isPrivate) "Only people you approve can see your posts and stories." else "Anyone can see your posts and follow you.",
+                    onClick = { if (me.isPrivate) vm.setPrivateAccount(false) else privateConfirm = true }
+                ) { Switch(me.isPrivate, { if (it) privateConfirm = true else vm.setPrivateAccount(false) }) }
+                if (me.isPrivate || me.followRequests > 0)
+                    SettingRow(
+                        "Follow requests" + (if (me.followRequests > 0) " (${me.followRequests})" else ""),
+                        "Approve or decline people who want to follow you.", onClick = { requestsOpen = true }
+                    )
+                SettingRow(
+                    "Who can see who you follow",
+                    when (me.followingPrivacy) { "followers" -> "Only my followers"; "me" -> "Only me"; else -> "Everyone" },
+                    onClick = { privacyOpen = true }
+                )
+
+                SettingsHeader("Email")
+                SettingRow(
+                    when {
+                        me.email == null -> "Add email"
+                        unverified -> "Verify email"
+                        else -> "Email"
+                    },
+                    when {
+                        me.email == null -> "Needed to reset your password."
+                        unverified -> "${me.email} · not verified"
+                        else -> "${me.email} ✓ verified"
+                    },
+                    titleColor = if (me.email == null || unverified) Color(0xFFD97706) else Color.Unspecified,
+                    onClick = { emailOpen = true }
+                )
+
+                SettingsHeader("Account")
+                SettingRow("Log out", titleColor = Color(0xFFC62828), onClick = { onClose(); vm.logout() })
+                Spacer(Modifier.height(24.dp))
+            }
+
+            if (requestsOpen) FollowRequestsDialog(vm) { requestsOpen = false }
+            if (emailOpen) EmailDialog(vm) { emailOpen = false }
+            if (privateConfirm) AlertDialog(
+                onDismissRequest = { privateConfirm = false },
+                title = { Text("Make your account private?") },
+                text = { Text("Only people you approve will see your posts and stories. Your current followers stay. New people must send a request.\n\nAny boost running on your posts stops right away. It is not restored if you go public again, and it is not refunded automatically.") },
+                confirmButton = { TextButton({ privateConfirm = false; vm.setPrivateAccount(true) }) { Text("Make private") } },
+                dismissButton = { TextButton({ privateConfirm = false }) { Text("Cancel") } }
+            )
+            if (privacyOpen) AlertDialog(
+                onDismissRequest = { privacyOpen = false },
+                title = { Text("Who can see who you follow?") },
+                text = {
+                    Column {
+                        for ((mode, label) in listOf("everyone" to "Everyone", "followers" to "Only my followers", "me" to "Only me")) {
+                            Row(
+                                Modifier.fillMaxWidth().clickable { vm.setFollowingPrivacy(mode); privacyOpen = false },
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                RadioButton(me.followingPrivacy == mode, { vm.setFollowingPrivacy(mode); privacyOpen = false })
+                                Text(label)
+                            }
+                        }
+                    }
+                },
+                confirmButton = { TextButton({ privacyOpen = false }) { Text("Close") } }
+            )
+        }
+    }
+}
+
 // ---------- Profile ----------
 @Composable
 fun ProfileScreen(vm: AppVm) {
@@ -1818,11 +1928,8 @@ fun ProfileScreen(vm: AppVm) {
     val mine = vm.posts.filter { it.user == me.username }
     var openPost by remember { mutableStateOf<Post?>(null) }
     var editing by remember { mutableStateOf(false) }
-    var emailOpen by remember { mutableStateOf(false) }
+    var settingsOpen by remember { mutableStateOf(false) }
     var vipOpen by remember { mutableStateOf(false) }
-    var privacyOpen by remember { mutableStateOf(false) }
-    var requestsOpen by remember { mutableStateOf(false) }
-    var privateConfirm by remember { mutableStateOf(false) }
     var listKind by remember { mutableStateOf<String?>(null) }
     val ctx = LocalContext.current
     var draftName by remember { mutableStateOf("") }
@@ -1842,36 +1949,13 @@ fun ProfileScreen(vm: AppVm) {
                 Text("${mine.size} posts  ·  ${mine.sumOf { it.likes }} likes", color = Color.Gray)
                 FollowCounts(me.followers, me.following, { listKind = "followers" }, { listKind = "following" })
             }
-            TextButton({ vm.logout() }) { Text("Log out") }
+            IconButton({ settingsOpen = true }) { Icon(Icons.Filled.Settings, "Settings") }
         }
         if (me.bio.isNotBlank()) Text(me.bio, Modifier.padding(horizontal = 16.dp))
-        val unverified = me.email != null && !me.emailVerified
-        Text(
-            when {
-                me.email == null -> "＋ Add email (needed to reset your password)"
-                unverified -> "${me.email} · not verified — tap to verify"
-                else -> "${me.email} ✓ verified"
-            },
-            color = if (me.email == null || unverified) Color(0xFFD97706) else Color.Gray,
-            fontSize = 13.sp,
-            modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp).clickable { emailOpen = true }
-        )
-        Row(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 2.dp), verticalAlignment = Alignment.CenterVertically) {
-            Column(Modifier.weight(1f)) {
-                Text("🔒 Private account", fontSize = 14.sp)
-                Text(if (me.isPrivate) "Only people you approve can see your posts." else "Anyone can see your posts and follow you.", color = Color.Gray, fontSize = 12.sp)
-            }
-            Switch(me.isPrivate, { if (it) privateConfirm = true else vm.setPrivateAccount(false) })
-        }
-        if (me.isPrivate || me.followRequests > 0) Text(
-            "Follow requests" + (if (me.followRequests > 0) " (${me.followRequests})" else ""),
-            color = Color(0xFF8134AF), fontSize = 14.sp, fontWeight = FontWeight.Medium,
-            modifier = Modifier.padding(horizontal = 16.dp, vertical = 6.dp).clickable { requestsOpen = true }
-        )
-        Text(
-            "🔒 Who can see who you follow: " + when (me.followingPrivacy) { "followers" -> "Followers"; "me" -> "Only me"; else -> "Everyone" },
-            color = Color.Gray, fontSize = 13.sp,
-            modifier = Modifier.padding(horizontal = 16.dp, vertical = 4.dp).clickable { privacyOpen = true }
+        if (me.email == null || !me.emailVerified) Text(
+            "⚠ Add and verify your email in Settings (needed to reset your password)",
+            color = Color(0xFFD97706), fontSize = 13.sp,
+            modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp).clickable { settingsOpen = true }
         )
         if (me.vip) {
             Row(Modifier.padding(horizontal = 16.dp), verticalAlignment = Alignment.CenterVertically) {
@@ -1906,35 +1990,7 @@ fun ProfileScreen(vm: AppVm) {
     }
     openPost?.let { PostDetail(vm, it) { openPost = null } }
     listKind?.let { FollowListDialog(vm, me.username, it) { listKind = null } }
-    if (requestsOpen) FollowRequestsDialog(vm) { requestsOpen = false }
-    if (privateConfirm) AlertDialog(
-        onDismissRequest = { privateConfirm = false },
-        title = { Text("Make your account private?") },
-        text = { Text("Only people you approve will see your posts and stories. Your current followers stay. New people must send a request.\n\nAny boost running on your posts stops right away. It is not restored if you go public again, and it is not refunded automatically.") },
-        confirmButton = { TextButton({ privateConfirm = false; vm.setPrivateAccount(true) }) { Text("Make private") } },
-        dismissButton = { TextButton({ privateConfirm = false }) { Text("Cancel") } }
-    )
-    if (privacyOpen) {
-        AlertDialog(
-            onDismissRequest = { privacyOpen = false },
-            title = { Text("Who can see who you follow?") },
-            text = {
-                Column {
-                    for ((mode, label) in listOf("everyone" to "Everyone", "followers" to "Only my followers", "me" to "Only me")) {
-                        Row(
-                            Modifier.fillMaxWidth().clickable { vm.setFollowingPrivacy(mode); privacyOpen = false },
-                            verticalAlignment = Alignment.CenterVertically
-                        ) {
-                            RadioButton(me.followingPrivacy == mode, { vm.setFollowingPrivacy(mode); privacyOpen = false })
-                            Text(label)
-                        }
-                    }
-                }
-            },
-            confirmButton = { TextButton({ privacyOpen = false }) { Text("Close") } }
-        )
-    }
-    if (emailOpen) EmailDialog(vm) { emailOpen = false }
+    if (settingsOpen) SettingsScreen(vm) { settingsOpen = false }
     if (vipOpen) VipDialog(vm) { vipOpen = false }
 
     if (editing) {
