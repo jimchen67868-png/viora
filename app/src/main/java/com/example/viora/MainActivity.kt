@@ -1967,6 +1967,7 @@ fun ProfileScreen(vm: AppVm) {
     var editing by remember { mutableStateOf(false) }
     var settingsOpen by remember { mutableStateOf(false) }
     var vipOpen by remember { mutableStateOf(false) }
+    var shareMineOpen by remember { mutableStateOf(false) }
     var listKind by remember { mutableStateOf<String?>(null) }
     val ctx = LocalContext.current
     var draftName by remember { mutableStateOf("") }
@@ -2010,10 +2011,13 @@ fun ProfileScreen(vm: AppVm) {
         } else {
             Button({ vipOpen = true }, Modifier.padding(horizontal = 16.dp)) { Text("⭐ Get VIP") }
         }
-        OutlinedButton(
-            onClick = { draftName = me.username; draftBio = me.bio; draftAvatar = null; removing = false; editing = true },
-            modifier = Modifier.fillMaxWidth().padding(16.dp)
-        ) { Text("Edit profile") }
+        Row(Modifier.fillMaxWidth().padding(16.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            OutlinedButton(
+                onClick = { draftName = me.username; draftBio = me.bio; draftAvatar = null; removing = false; editing = true },
+                modifier = Modifier.weight(1f)
+            ) { Text("Edit profile") }
+            OutlinedButton({ shareMineOpen = true }, Modifier.weight(1f)) { Text("Share profile") }
+        }
         HorizontalDivider()
         if (mine.isEmpty()) Text("Share your first photo from the + tab.", Modifier.padding(16.dp), color = Color.Gray)
         LazyVerticalGrid(GridCells.Fixed(3), horizontalArrangement = Arrangement.spacedBy(2.dp), verticalArrangement = Arrangement.spacedBy(2.dp)) {
@@ -2029,6 +2033,7 @@ fun ProfileScreen(vm: AppVm) {
     listKind?.let { FollowListDialog(vm, me.username, it) { listKind = null } }
     if (settingsOpen) SettingsScreen(vm) { settingsOpen = false }
     if (vipOpen) VipDialog(vm) { vipOpen = false }
+    if (shareMineOpen) SendDialog(vm, "Share profile", "$SERVER_URL/u/${me.username}", "${me.username} on Viora\n$SERVER_URL/u/${me.username}") { shareMineOpen = false }
 
     if (editing) {
         AlertDialog(
