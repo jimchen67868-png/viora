@@ -90,6 +90,11 @@ try:  # boosts paused by an earlier version end at the moment they were paused
     with db() as _c: _c.execute("UPDATE boosts SET ends=paused_at, paused_at=NULL WHERE paused_at IS NOT NULL")
 except Exception:
     pass
+for _col in ("sender_hidden", "recipient_hidden"):
+    try:  # a message can be deleted on one side only
+        with db() as _c: _c.execute(f"ALTER TABLE messages ADD COLUMN {'IF NOT EXISTS ' if PG else ''}{_col} INTEGER NOT NULL DEFAULT 0")
+    except Exception:
+        pass
 with db() as _c:  # an email can belong to only one account once verified
     _c.execute("CREATE UNIQUE INDEX IF NOT EXISTS users_email ON users(LOWER(email)) WHERE email_verified=1")
 
@@ -1129,7 +1134,7 @@ def dm_json(r, me):
 def dm_unread(h, q):
     with db() as c:
         u = h.user(c)
-        n = c.execute("SELECT COUNT(*) AS n FROM messages WHERE recipient_id=? AND seen=0", (u["id"],)).fetchone()["n"]
+        n = c.execute("SELECT COUNT(*) AS n FROM messages WHERE recipient_id=? AND seen=0 AND recipient_hidden=0", (u["id"],)).fetchone()["n"]
         a = c.execute("SELECT COUNT(*) AS n FROM notifications WHERE user_id=? AND seen=0", (u["id"],)).fetchone()["n"]
     h.send_json(200, {"count": int(n), "activity": int(a)})
 
@@ -1141,8 +1146,9 @@ def dm_inbox(h, q):
             "SELECT other, MAX(id) AS last_id, SUM(CASE WHEN recipient_id=? AND seen=0 THEN 1 ELSE 0 END) AS unread FROM "
             "(SELECT m.id, m.recipient_id, m.seen, CASE WHEN m.sender_id=? THEN m.recipient_id ELSE m.sender_id END AS other "
             "FROM messages m WHERE (m.sender_id=? OR m.recipient_id=?) AND m.id > COALESCE((SELECT d.upto FROM dm_cleared d WHERE d.user_id=? "
-            "AND d.other_id=(CASE WHEN m.sender_id=? THEN m.recipient_id ELSE m.sender_id END)), 0)) t "
-            "GROUP BY other ORDER BY last_id DESC LIMIT 100", (me, me, me, me, me, me)).fetchall()
+            "AND d.other_id=(CASE WHEN m.sender_id=? THEN m.recipient_id ELSE m.sender_id END)), 0) "
+            "AND ((m.sender_id=? AND m.sender_hidden=0) OR (m.recipient_id=? AND m.recipient_hidden=0))) t "
+            "GROUP BY other ORDER BY last_id DESC LIMIT 100", (me, me, me, me, me, me, me, me)).fetchall()
         out = []
         for r in rows:
             m = c.execute("SELECT * FROM messages WHERE id=?", (r["last_id"],)).fetchone()
@@ -1161,10 +1167,22 @@ def dm_thread(h, q, name):
         cleared = c.execute("SELECT upto FROM dm_cleared WHERE user_id=? AND other_id=?", (me, t["id"])).fetchone()
         floor = max(after, int(cleared["upto"]) if cleared else 0)   # messages you deleted stay hidden
         rows = c.execute("SELECT * FROM messages WHERE ((sender_id=? AND recipient_id=?) OR (sender_id=? AND recipient_id=?)) AND id>? "
-                         "ORDER BY id DESC LIMIT 100", (me, t["id"], t["id"], me, floor)).fetchall()
+                         "AND ((sender_id=? AND sender_hidden=0) OR (recipient_id=? AND recipient_hidden=0)) "
+                         "ORDER BY id DESC LIMIT 100", (me, t["id"], t["id"], me, floor, me, me)).fetchall()
         c.execute("UPDATE messages SET seen=1 WHERE recipient_id=? AND sender_id=? AND seen=0", (me, t["id"]))
     h.send_json(200, {"messages": [dm_json(r, me) for r in reversed(rows)],
                       "user": {"username": t["username"], "avatar": h.url(t["avatar"])}})
+
+@route("DELETE", r"/api/messages/(\d+)")
+def dm_delete_one(h, q, mid):
+    """Deletes one message on the caller's side only."""
+    with db() as c:
+        me = h.user(c)["id"]
+        m = c.execute("SELECT sender_id, recipient_id FROM messages WHERE id=?", (int(mid),)).fetchone()
+        if not m or me not in (m["sender_id"], m["recipient_id"]): raise HTTPError(404, "Message not found")
+        if m["sender_id"] == me: c.execute("UPDATE messages SET sender_hidden=1 WHERE id=?", (int(mid),))
+        else: c.execute("UPDATE messages SET recipient_hidden=1, seen=1 WHERE id=?", (int(mid),))
+    h.send_json(200, {"ok": True})
 
 @route("DELETE", r"/api/messages/with/([A-Za-z0-9_.]{3,20})")
 def dm_delete(h, q, name):

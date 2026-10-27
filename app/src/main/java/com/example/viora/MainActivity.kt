@@ -34,6 +34,8 @@ import androidx.compose.foundation.gestures.detectTransformGestures
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.activity.compose.BackHandler
+import androidx.compose.foundation.ExperimentalFoundationApi
+import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.lazy.grid.GridCells
@@ -676,8 +678,9 @@ fun SendDialog(vm: AppVm, title: String, link: String, outsideText: String, onCl
 private val userLink = Regex("^" + Regex.escape(SERVER_URL) + "/u/([A-Za-z0-9_.]{3,20})$")
 fun userLinkName(text: String): String? = userLink.matchEntire(text.trim())?.groupValues?.get(1)
 
+@OptIn(ExperimentalFoundationApi::class)
 @Composable
-fun SharedUserCard(vm: AppVm, name: String) {
+fun SharedUserCard(vm: AppVm, name: String, onLongClick: () -> Unit = {}) {
     val profile by produceState<Profile?>(null, name) {
         value = try { vm.api.user(name).first }
         catch (e: CancellationException) { throw e }
@@ -685,7 +688,7 @@ fun SharedUserCard(vm: AppVm, name: String) {
     }
     Surface(
         shape = RoundedCornerShape(12.dp), tonalElevation = 3.dp,
-        modifier = Modifier.width(240.dp).clickable { vm.pendingUser = name }
+        modifier = Modifier.width(240.dp).combinedClickable(onClick = { vm.pendingUser = name }, onLongClick = onLongClick)
     ) {
         Row(Modifier.padding(12.dp), verticalAlignment = Alignment.CenterVertically) {
             Avatar(name, profile?.avatar, Modifier.size(52.dp))
@@ -700,8 +703,9 @@ fun SharedUserCard(vm: AppVm, name: String) {
     }
 }
 
+@OptIn(ExperimentalFoundationApi::class)
 @Composable
-fun SharedPostCard(vm: AppVm, id: Int) {
+fun SharedPostCard(vm: AppVm, id: Int, onLongClick: () -> Unit = {}) {
     val state by produceState<Pair<Boolean, Post?>>(false to null, id) {
         value = try { true to vm.api.post(id) }
         catch (e: CancellationException) { throw e }
@@ -711,7 +715,7 @@ fun SharedPostCard(vm: AppVm, id: Int) {
     val post = state.second
     Surface(
         shape = RoundedCornerShape(12.dp), tonalElevation = 3.dp,
-        modifier = Modifier.width(240.dp).clickable(enabled = post != null) { post?.let { vm.sharedPost = it } }
+        modifier = Modifier.width(240.dp).combinedClickable(onClick = { post?.let { vm.sharedPost = it } }, onLongClick = onLongClick)
     ) {
         Column {
             if (post == null) Text(if (done) "This post is no longer available." else "Loading post…", Modifier.padding(12.dp), color = Color.Gray)
@@ -1611,6 +1615,7 @@ fun DeleteChatDialog(vm: AppVm, username: String, onDismiss: () -> Unit, onDelet
     )
 }
 
+@OptIn(ExperimentalFoundationApi::class)
 @Composable
 fun ChatScreen(vm: AppVm, username: String, onClose: () -> Unit) {
     val msgs = remember { mutableStateListOf<Dm>() }
@@ -1620,6 +1625,7 @@ fun ChatScreen(vm: AppVm, username: String, onClose: () -> Unit) {
     var avatar by remember { mutableStateOf<String?>(null) }
     var menu by remember { mutableStateOf(false) }
     var deleting by remember { mutableStateOf(false) }
+    var menuFor by remember { mutableStateOf<Int?>(null) }   // the message whose long-press menu is open
     val listState = rememberLazyListState()
     val scope = rememberCoroutineScope()
     LaunchedEffect(username) {   // fetch new messages every few seconds while the chat is open
@@ -1665,9 +1671,10 @@ fun ChatScreen(vm: AppVm, username: String, onClose: () -> Unit) {
                             Column(Modifier.widthIn(max = 300.dp), horizontalAlignment = if (m.mine) Alignment.End else Alignment.Start) {
                                 val shared = postLinkId(m.text)
                                 val sharedUser = userLinkName(m.text)
-                                if (shared != null) SharedPostCard(vm, shared)
-                                else if (sharedUser != null) SharedUserCard(vm, sharedUser)
+                                if (shared != null) SharedPostCard(vm, shared, onLongClick = { menuFor = m.id })
+                                else if (sharedUser != null) SharedUserCard(vm, sharedUser, onLongClick = { menuFor = m.id })
                                 else Surface(
+                                    modifier = Modifier.combinedClickable(onClick = {}, onLongClick = { menuFor = m.id }),
                                     shape = RoundedCornerShape(16.dp),
                                     color = if (m.mine) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.surfaceVariant
                                 ) {
@@ -1677,6 +1684,19 @@ fun ChatScreen(vm: AppVm, username: String, onClose: () -> Unit) {
                                     )
                                 }
                                 if (m.created > 0) Text(timeAgo(m.created), fontSize = 10.sp, color = Color.Gray)
+                            }
+                            DropdownMenu(menuFor == m.id, { menuFor = null }) {
+                                DropdownMenuItem(
+                                    text = { Text("Delete for me") },
+                                    onClick = {
+                                        menuFor = null
+                                        scope.launch {
+                                            try { vm.api.deleteMessage(m.id); msgs.removeAll { it.id == m.id }; vm.refreshUnread() }
+                                            catch (e: CancellationException) { throw e }
+                                            catch (e: Exception) { vm.toast(e.message) }
+                                        }
+                                    }
+                                )
                             }
                         }
                     }

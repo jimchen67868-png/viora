@@ -170,6 +170,7 @@ class Api(var base: String, var token: String?) {
     suspend fun sendDm(name: String, text: String): Dm =
         send("POST", "/api/messages/to/" + enc(name), json("text" to text)).getJSONObject("message").toDm()
     /** (unread messages, unread activity) */
+    suspend fun deleteMessage(id: Int) { send("DELETE", "/api/messages/$id") }
     suspend fun deleteChat(name: String) { send("DELETE", "/api/messages/with/" + enc(name)) }
     suspend fun unreadCounts(): Pair<Int, Int> {
         val j = send("GET", "/api/messages/unread")
